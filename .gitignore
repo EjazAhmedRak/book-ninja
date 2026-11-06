@@ -36,3 +36,4 @@ override.tf.json
 infra/backends/*.hcl
 !infra/backends/*.hcl.example
 infra/backend.tf
+infra/local.auto.tfvars.json
