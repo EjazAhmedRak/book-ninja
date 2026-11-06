@@ -1,0 +1,6 @@
+# Copy this file to ../backend.tf before initializing an AWS environment.
+# The root configuration deliberately omits a backend so Floci validation uses
+# Terraform's default local-state backend without any special flags.
+terraform {
+  backend "s3" {}
+}
