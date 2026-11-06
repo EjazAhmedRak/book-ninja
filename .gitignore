@@ -21,3 +21,18 @@ apps/backend/venv/
 .env.*
 !*.env.example
 !apps/backend/.env.example
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+infra/backends/*.hcl
+!infra/backends/*.hcl.example
+infra/backend.tf
