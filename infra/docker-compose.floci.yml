@@ -1,0 +1,16 @@
+services:
+  floci:
+    image: floci/floci:latest
+    ports:
+      - "4566:4566"
+    environment:
+      FLOCI_STORAGE_MODE: persistent
+      FLOCI_STORAGE_PERSISTENT_PATH: /app/data
+      FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED: "true"
+      FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL: "true"
+      FLOCI_SERVICES_S3_ENFORCE_AUTH: "true"
+    volumes:
+      - floci-data:/app/data
+
+volumes:
+  floci-data:

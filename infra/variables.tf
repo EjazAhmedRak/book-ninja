@@ -43,15 +43,15 @@ variable "floci_endpoint" {
 }
 
 variable "local_aws_access_key" {
-  description = "Throwaway local AWS-compatible access key. Do not use a real AWS key."
+  description = "Local Floci IAM access key. Do not use a real AWS key."
   type        = string
-  default     = "test"
+  default     = null
   sensitive   = true
 }
 
 variable "local_aws_secret_key" {
-  description = "Throwaway local AWS-compatible secret key. Do not use a real AWS key."
+  description = "Local Floci IAM secret key. Do not use a real AWS key."
   type        = string
-  default     = "test"
+  default     = null
   sensitive   = true
 }
