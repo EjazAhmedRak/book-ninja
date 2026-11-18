@@ -8,6 +8,12 @@ from models.health import HealthResponse
 router = APIRouter(tags=["Health"])
 
 
+@router.get("/livez")
+async def liveness():
+    """Lightweight pod probe; external provider health is checked separately."""
+    return {"status": "ok"}
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health():
     """Checks the status of all four external integrations. No auth required."""

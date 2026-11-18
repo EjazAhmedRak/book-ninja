@@ -1,4 +1,16 @@
-from unittest.mock import patch, AsyncMock
+from unittest.mock import AsyncMock, patch
+
+
+def test_liveness_does_not_call_external_integrations(test_client):
+    with (
+        patch("api.routes.health.ping_mongo", new_callable=AsyncMock) as mongo,
+        patch("api.routes.health.httpx.AsyncClient") as http,
+    ):
+        response = test_client.get("/livez")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    mongo.assert_not_called()
+    http.assert_not_called()
 
 
 def test_health_returns_200(test_client):

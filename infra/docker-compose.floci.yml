@@ -11,6 +11,8 @@ services:
       FLOCI_SERVICES_S3_ENFORCE_AUTH: "true"
     volumes:
       - floci-data:/app/data
+      # Floci creates a privileged k3s container for emulated EKS.
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   floci-data:
