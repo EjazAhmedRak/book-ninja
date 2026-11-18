@@ -9,7 +9,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 COPY --from=builder /install /usr/local
-COPY . .
+COPY src/ ./src/
 
 RUN adduser --disabled-password --gecos "" appuser
 USER appuser

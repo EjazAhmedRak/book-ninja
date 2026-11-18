@@ -4,6 +4,42 @@ variable "aws_region" {
   default     = "ap-south-1"
 }
 
+variable "local_provisioning_access_key" {
+  description = "Local Floci provisioning identity; independent of backend credentials."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "local_provisioning_secret_key" {
+  description = "Secret for the local provisioning identity."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+variable "vpc_cidr" {
+  description = "IPv4 VPC range. Four subnet bits are reserved for each subnet."
+  type        = string
+  default     = "10.60.0.0/16"
+
+  validation {
+    condition     = can(cidrnetmask(var.vpc_cidr)) && can(regex("/(16|17|18|19|20)$", var.vpc_cidr))
+    error_message = "vpc_cidr must be an IPv4 CIDR with a /16 through /20 prefix."
+  }
+}
+
+variable "availability_zones" {
+  description = "Two distinct AZs in aws_region; defaults to the region's a and b zones."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.availability_zones) == 0 || (length(var.availability_zones) == 2 && length(distinct(var.availability_zones)) == 2)
+    error_message = "Provide exactly two distinct availability zones, or leave empty."
+  }
+}
+
 variable "environment" {
   description = "Deployment environment name."
   type        = string

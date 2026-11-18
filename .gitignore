@@ -37,3 +37,6 @@ infra/backends/*.hcl
 !infra/backends/*.hcl.example
 infra/backend.tf
 infra/local.auto.tfvars.json
+infra/local.provisioner.auto.tfvars.json
+infra/local.kubeconfig.json
+infra/manual/

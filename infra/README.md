@@ -1,6 +1,10 @@
 # Terraform infrastructure
 
-This directory begins Stage 1 of `Hosting_Deployment_Design.md`: Terraform provider and state configuration. Local state is stored in persistent Floci S3 with DynamoDB locking.
+For the full manual AWS CLI sequence, including equivalents of the Python
+helpers and Terraform resources, see [the provisioning runbook](../docs/FLOCI_MANUAL_PROVISIONING.md).
+Update that runbook whenever provisioning changes.
+
+This directory implements provider/state, networking, EKS, and the backend registry from Stage 1 of `Hosting_Deployment_Design.md`. Local state is stored in persistent Floci S3 with DynamoDB locking.
 
 ## Safety model
 
@@ -25,6 +29,7 @@ Requires Python 3, AWS CLI, Docker Compose, and Terraform >= 1.7. Run from this 
 
 ```sh
 python3 scripts/bootstrap_floci.py
+python3 scripts/bootstrap_provisioner.py
 terraform init -migrate-state -backend-config=backends/local.hcl
 terraform validate
 terraform plan -var-file=environments/local.tfvars
@@ -33,8 +38,12 @@ terraform plan -var-file=environments/local.tfvars
 The script creates the versioned, public-access-blocked `book-ninja-tfstate`
 bucket, `book-ninja-tflock` lock table, and `book-ninja-terraform-state` IAM user.
 This user can list the state bucket, read/write its `local/` objects, and access
-the lock table. It cannot provision application infrastructure; a separate
-provisioning identity will be configured for the next infrastructure increment.
+the lock table. It cannot provision application infrastructure. The separate
+`book-ninja-network-provisioner` identity created by `bootstrap_provisioner.py`
+has EC2 networking, EKS and ECR permissions, plus IAM management of only
+`book-ninja-local-*` roles. It has no state-bucket permissions. Its
+owner-only credentials are saved in ignored `local.provisioner.auto.tfvars.json`.
+The provider uses these credentials while the S3 backend retains the state user.
 
 Generated `backend.tf`, `backends/local.hcl`, and `local.auto.tfvars.json` are
 ignored by Git. Credential files are written with owner-only permissions; keys
@@ -61,6 +70,101 @@ terraform plan -var-file=environments/dev.tfvars
 
 Production follows the same pattern with `prod.hcl` and `prod.tfvars`. The state S3 bucket and DynamoDB lock table must be bootstrapped separately before the first remote Terraform initialization. They must be encrypted, versioned, private, and access-controlled.
 
-## Next infrastructure increment
+## Network foundation
 
-Add the VPC, subnet, NAT Gateway, route-table, and security-group resources in `vpc.tf`. Keep any Floci service gaps isolated behind `local_validation`; do not weaken production network controls to emulate a local service.
+`vpc.tf` creates a DNS-enabled VPC with two public and two private subnets,
+an Internet Gateway, route tables and associations, and NAT egress. Local
+validation uses one emulated NAT gateway; AWS uses one per AZ. No subnet assigns
+public IPs automatically. AZs and the VPC CIDR can be overridden through variables.
+The default VPC CIDR is `10.60.0.0/16`; local validation rejects the k3s pod
+and service ranges to prevent overlapping Docker/pod addresses.
+
+The security groups reserve the private path: VPC Link -> ALB TCP 80 -> backend
+TCP 8000. Backend egress and Kubernetes cluster/node networking will be added
+with EKS and the egress layer; these groups alone do not deploy a working service.
+Floci emulates NAT addresses and routing metadata; this does not establish real
+AWS network isolation or a real outbound MongoDB allowlist address.
+
+```sh
+terraform test
+terraform plan -var-file=environments/local.tfvars -out=network.tfplan
+terraform apply network.tfplan
+terraform plan -var-file=environments/local.tfvars
+terraform output
+```
+
+Mock-provider tests cover subnet exposure, CIDR separation, local/AWS NAT
+topologies, and invalid input rejection. Saved plan files can contain credentials
+and are ignored by Git.
+
+## EKS and backend registry
+
+`eks.tf` creates cluster/node IAM roles, an EKS cluster, and a private-subnet
+node group. AWS cluster API access is private; the local emulator exposes its
+k3s API on a localhost port. Floci runs one k3s container even though node-group
+scaling values model AWS workers. This is a development cluster, not equivalent
+to an AWS highly available deployment. `ecr.tf` creates an immutable-tag backend
+repository with scan-on-push and untagged-image cleanup.
+
+Compose mounts the Docker daemon socket so Floci can create privileged k3s
+and registry containers. Keep this local emulator trusted.
+
+After applying Terraform, generate a separate kubeconfig and verify the node:
+
+```sh
+python3 scripts/configure_kubeconfig.py
+kubectl --kubeconfig local.kubeconfig.json get nodes
+python3 scripts/floci_aws.py eks describe-cluster --name book-ninja-local
+python3 scripts/floci_aws.py ecr describe-repositories
+```
+
+The kubeconfig exec helper reads the ignored provisioning credentials at token
+generation time; it does not embed secrets or change the default kubeconfig.
+
+During validation with Floci 2.4.0 and AWS provider 5.100.0, cluster creation
+completed in Floci while the Terraform create call kept retrying. If this
+happens, confirm the cluster is `ACTIVE` with the CLI helper, stop the apply
+gracefully with Ctrl-C, and import that existing cluster before replanning:
+
+```sh
+terraform import -var-file=environments/local.tfvars aws_eks_cluster.main book-ninja-local
+terraform plan -var-file=environments/local.tfvars
+```
+
+Do not apply a replacement plan for a cluster holding workloads without review.
+Local `bootstrap_self_managed_addons` is disabled because k3s owns its built-in
+components; AWS retains its provider default behavior.
+
+The backend image now copies only `src/` into the runtime image and excludes
+environment files from the build context. `/livez` provides a lightweight
+Kubernetes probe without calling external providers; `/health` retains the
+existing integration diagnostics.
+
+## Remaining deployment work
+
+API Gateway integration, runtime secret values/injection, application manifests,
+frontend publication, and GitOps remain to be implemented.
+Backend and frontend
+configuration must be supplied in their ignored `.env` files before application
+deployment. Keep Floci-specific accommodations isolated from AWS environments.
+
+## Private frontend hosting and runtime secret metadata
+
+`s3_cloudfront.tf` creates a versioned, encrypted frontend bucket with public
+access blocked, lifecycle cleanup, and a CloudFront OAC signing every origin
+request. The bucket policy grants reads to only the distribution's service
+principal and ARN. The distribution supports React Router fallback paths. Local
+viewers use HTTP on port 4566; AWS redirects to HTTPS on the default CloudFront
+domain. Custom DNS/ACM remain future work. `terraform output frontend_url`
+returns the viewer address for the checked-in local port configuration.
+
+`secrets.tf` creates `book-ninja/local/backend` metadata locally (environment
+name varies in AWS). Values must be populated outside Terraform; no application
+credentials are written to Terraform state. Kubernetes secret synchronization
+is still pending.
+
+Run `python3 scripts/bootstrap_provisioner.py` to refresh the existing IAM
+policy before applying these additions. The script reuses its active key.
+Manual CLI equivalents and delivery/anonymous-denial checks are documented in
+sections 17-18 of the runbook. The backend/frontend `.env` files are absent in
+this checkout, so an authenticated Book Ninja rollout has not yet been attempted.

@@ -1,5 +1,14 @@
 # Repository Guidelines
 
+## Provisioning Runbook Maintenance
+Whenever provisioning is added or changed, update `docs/FLOCI_MANUAL_PROVISIONING.md`
+in the same change. Include the equivalent manual AWS CLI commands in dependency
+order, the executing IAM identity, verification, credential-file handling, and
+Floci/AWS differences. Keep future work distinct from completed provisioning;
+never include live credentials in the runbook.
+Use native AWS CLI, Docker, Terraform, and kubectl commands in that runbook;
+do not prefix its examples with RTK or other command wrappers.
+
 ## Project Structure & Module Organization
 This monorepo has two apps. `apps/backend` is the FastAPI + LangGraph service; source lives in `src`, with routes in `api/routes`, agent logic in `agent`, models in `models`, database helpers in `db`, and utilities in `utils`. Backend tests are in `apps/backend/tests`. `apps/frontend` is the Vite + React app; UI code lives in `src/components`, `src/pages`, `src/store`, `src/api`, `src/assets`, and `src/test`.
 
