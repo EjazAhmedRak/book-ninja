@@ -144,6 +144,9 @@ existing integration diagnostics.
 
 API Gateway integration, runtime secret values, application rollout,
 frontend publication, and GitOps remain to be implemented.
+The local [Argo CD platform](../gitops/platform/argocd/README.md) is installed
+with scoped projects and a manual backend preview. Root GitOps adoption awaits
+review/merge of its manifests; backend sync still needs real runtime values.
 The [backend workload chart](../gitops/charts/book-ninja/README.md) is prepared
 and validated. Local ECR publication and k3s image execution are verified using
 `scripts/publish_backend.py` and `scripts/verify_backend_image.py`; the actual

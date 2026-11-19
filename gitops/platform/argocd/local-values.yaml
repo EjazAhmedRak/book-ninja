@@ -1,0 +1,71 @@
+# Local single-node bootstrap, not a production HA/SSO configuration.
+configs:
+  cm:
+    admin.enabled: "true"
+    users.anonymous.enabled: "false"
+    exec.enabled: "false"
+  params:
+    server.insecure: "false"
+    controller.status.processors: "2"
+    controller.operation.processors: "1"
+    controller.kubectl.parallelism.limit: "2"
+    reposerver.parallelism.limit: "1"
+  rbac:
+    policy.default: ""
+    policy.csv: ""
+dex:
+  enabled: false
+notifications:
+  enabled: false
+applicationSet:
+  replicas: 0
+controller:
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: 500m, memory: 768Mi}
+  readinessProbe:
+    timeoutSeconds: 5
+  startupProbe:
+    enabled: true
+    timeoutSeconds: 5
+    failureThreshold: 36
+server:
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: false
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 250m, memory: 384Mi}
+  readinessProbe:
+    timeoutSeconds: 5
+    failureThreshold: 6
+  livenessProbe:
+    timeoutSeconds: 5
+    failureThreshold: 6
+  startupProbe:
+    enabled: true
+    timeoutSeconds: 5
+    failureThreshold: 36
+repoServer:
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+  readinessProbe:
+    timeoutSeconds: 5
+    failureThreshold: 6
+  livenessProbe:
+    timeoutSeconds: 5
+    failureThreshold: 6
+  startupProbe:
+    enabled: true
+    timeoutSeconds: 5
+    failureThreshold: 36
+redis:
+  resources:
+    requests: {cpu: 25m, memory: 32Mi}
+    limits: {cpu: 250m, memory: 128Mi}
+redisSecretInit:
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 100m, memory: 64Mi}

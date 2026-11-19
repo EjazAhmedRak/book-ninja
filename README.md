@@ -2,6 +2,10 @@
 
 This repository is a monorepo with separate backend and frontend apps.
 
+For daily cluster checks and application debugging, see
+[Common commands](docs/COMMON_COMMANDS.md). Infrastructure setup is documented
+in the [manual Floci provisioning runbook](docs/FLOCI_MANUAL_PROVISIONING.md).
+
 ## Repository Structure
 
 - `apps/backend` - FastAPI + LangGraph backend

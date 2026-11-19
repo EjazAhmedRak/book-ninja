@@ -1,0 +1,49 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: argocd
+spec:
+  description: Default project disabled; use an explicitly scoped project.
+  sourceRepos: []
+  destinations: []
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist: []
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: book-ninja-local
+  namespace: argocd
+spec:
+  description: Local backend workloads only; platform and runtime secrets are separate.
+  sourceRepos:
+    - https://github.com/EjazAhmedRak/book-ninja.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: book-ninja
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - {group: "", kind: ConfigMap}
+    - {group: "", kind: Service}
+    - {group: "", kind: ServiceAccount}
+    - {group: apps, kind: Deployment}
+    - {group: autoscaling, kind: HorizontalPodAutoscaler}
+    - {group: policy, kind: PodDisruptionBudget}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: book-ninja-bootstrap
+  namespace: argocd
+spec:
+  description: Trusted root application metadata only; protect changes to this path.
+  sourceRepos:
+    - https://github.com/EjazAhmedRak/book-ninja.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - {group: argoproj.io, kind: AppProject}
+    - {group: argoproj.io, kind: Application}

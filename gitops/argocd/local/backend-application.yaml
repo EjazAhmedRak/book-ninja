@@ -1,0 +1,25 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: book-ninja-local-backend
+  namespace: argocd
+spec:
+  project: book-ninja-local
+  source:
+    repoURL: https://github.com/EjazAhmedRak/book-ninja.git
+    targetRevision: develop
+    path: gitops/charts/book-ninja
+    helm:
+      releaseName: book-ninja
+      valueFiles:
+        - ../../environments/local/backend-values.yaml
+      parameters:
+        - name: config.FRONTEND_ORIGINS
+          value: http://ev6uo3jvcb3wg6.cloudfront.localhost.floci.io:4566
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: book-ninja
+  # No automated policy or deletion finalizer during runtime-secret preparation.
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=false

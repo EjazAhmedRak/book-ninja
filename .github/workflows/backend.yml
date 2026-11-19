@@ -9,6 +9,8 @@ on:
       - 'infra/scripts/**'
       - 'infra/tests/**'
       - 'gitops/charts/book-ninja/**'
+      - 'gitops/argocd/**'
+      - 'gitops/platform/argocd/**'
   pull_request:
     branches: [main, develop]
     paths:
@@ -17,6 +19,8 @@ on:
       - 'infra/scripts/**'
       - 'infra/tests/**'
       - 'gitops/charts/book-ninja/**'
+      - 'gitops/argocd/**'
+      - 'gitops/platform/argocd/**'
       - 'gitops/environments/local/backend-values.yaml'
 
 permissions:
@@ -82,3 +86,9 @@ jobs:
           helm template book-ninja gitops/charts/book-ninja -n book-ninja \
             -f gitops/environments/local/backend-values.yaml \
             --set-string config.FRONTEND_ORIGINS=http://localhost:5173 > /tmp/backend-rendered.yaml
+      - name: Validate pinned Argo CD bootstrap chart
+        run: |
+          bash -n gitops/platform/argocd/install-local.sh
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm template argocd argo/argo-cd --version 10.18.1 -n argocd \
+            -f gitops/platform/argocd/local-values.yaml > /tmp/argocd-rendered.yaml
