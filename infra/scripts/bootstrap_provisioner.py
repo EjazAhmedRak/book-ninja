@@ -37,6 +37,12 @@ def main():
         "Resource": "arn:aws:secretsmanager:us-east-1:000000000000:secret:book-ninja/local/*",
     }, {
         "Effect": "Allow", "Action": [
+            "iam:CreateUser", "iam:GetUser", "iam:DeleteUser", "iam:TagUser", "iam:UntagUser",
+            "iam:ListUserTags", "iam:PutUserPolicy", "iam:GetUserPolicy", "iam:DeleteUserPolicy",
+            "iam:ListUserPolicies", "iam:ListAttachedUserPolicies",
+        ], "Resource": "arn:aws:iam::000000000000:user/book-ninja-local-external-secrets",
+    }, {
+        "Effect": "Allow", "Action": [
             "iam:CreateRole", "iam:GetRole", "iam:DeleteRole", "iam:TagRole", "iam:UntagRole",
             "iam:ListRolePolicies", "iam:ListAttachedRolePolicies", "iam:ListInstanceProfilesForRole",
             "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PassRole",

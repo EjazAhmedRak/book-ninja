@@ -1,0 +1,40 @@
+# Local Floci only. All stores managed by this controller use these endpoints.
+# Chart version is pinned in install-local.sh.
+controllerClass: book-ninja-local
+scopedNamespace: book-ninja
+scopedRBAC: true
+processClusterExternalSecret: false
+processClusterPushSecret: false
+processClusterStore: false
+processClusterGenerator: false
+processPushSecret: false
+extraEnv:
+  - name: AWS_SECRETSMANAGER_ENDPOINT
+    value: http://floci-aws.book-ninja.svc.cluster.local:4566
+  - name: AWS_STS_ENDPOINT
+    value: http://floci-aws.book-ninja.svc.cluster.local:4566
+  - name: AWS_EC2_METADATA_DISABLED
+    value: "true"
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+webhook:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+certController:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
