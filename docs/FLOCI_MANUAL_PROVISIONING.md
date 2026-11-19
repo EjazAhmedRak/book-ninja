@@ -1,6 +1,6 @@
 # Book Ninja: manual Floci provisioning runbook
 
-Last updated: 2026-11-18.
+Last updated: 2026-11-19.
 
 This is the ongoing record of provisioning performed for Book Ninja. Update it
 whenever provisioning is added or changed, including commands, identity,
@@ -8,7 +8,7 @@ dependencies, verification, and any Floci-specific behavior.
 
 ## Scope and execution rules
 
-This runbook replaces the four Python helpers with AWS CLI commands and also
+This runbook replaces the provisioning Python helpers with native CLI commands and also
 shows the CLI equivalents of the infrastructure currently managed by Terraform.
 No Python script is required to follow the manual path.
 
@@ -574,8 +574,9 @@ aws --endpoint-url "$FLOCI_ENDPOINT" ecr get-lifecycle-policy \
 ```
 
 This creates the repository and its settings. Building, pushing, scanning,
-and deploying an image are separate actions. We have built the backend image
-locally, but have not verified an image push or scanner behavior in Floci.
+and deploying an image are separate actions. Section 20 records the verified
+image push/pull and local k3s image execution. Scan-on-push is configuration
+metadata in Floci, not evidence of a vulnerability scan.
 
 ## 13. Configure kubectl without the Python helpers
 
@@ -1009,7 +1010,407 @@ the cleanup block even if verification fails. Permanent IAM permission remains
 backend-only. AWS workload identity and production installation are not covered
 by this local static-key accommodation.
 
-## 20. Maintenance notes and future provisioning log
+## 20. Backend image publication and workload preparation (2026-11-19)
+
+Completed: publish the backend to local ECR under an immutable Git SHA, pull by
+digest, import the exact manifest into k3s, and run a disposable image probe.
+Prepared: Helm workload chart. The application release is **not installed**;
+real runtime values are still missing. All commands below run from `infra/`.
+
+### Build and publish with the provisioning identity
+
+The helpers are optional conveniences:
+
+```sh
+python3 scripts/publish_backend.py
+python3 scripts/verify_backend_image.py
+```
+
+Their native CLI equivalents follow. Use the existing generated provisioning
+profile, not bootstrap administrator keys. The image has no application values
+and its build context excludes `.env` files. Commit backend source before using
+a Git SHA tag. The current receipt is ignored `manual/backend-image.json`.
+
+```sh
+set -euo pipefail
+export AWS_PROFILE=book-ninja-floci-provisioner
+export AWS_DEFAULT_REGION=us-east-1 AWS_PAGER=""
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+FLOCI_ENDPOINT=http://localhost:4566
+aws --endpoint-url "$FLOCI_ENDPOINT" sts get-caller-identity
+aws --endpoint-url "$FLOCI_ENDPOINT" ecr describe-repositories \
+  --repository-names book-ninja-local-backend
+mkdir -p manual
+test -z "$(git status --porcelain --untracked-files=all -- ../apps/backend)"
+IMAGE_REVISION=$(git rev-parse HEAD)
+NODE_ARCH=$(kubectl --kubeconfig local.kubeconfig.json get nodes \
+  -o 'jsonpath={.items[0].status.nodeInfo.architecture}')
+IMAGE_PLATFORM="linux/$NODE_ARCH"
+IMAGE_REPOSITORY=localhost:4566/000000000000/us-east-1/book-ninja-local-backend
+IMAGE_TAG="$IMAGE_REPOSITORY:$IMAGE_REVISION"
+aws --endpoint-url "$FLOCI_ENDPOINT" ecr describe-images \
+  --repository-name book-ninja-local-backend > manual/backend-images.json
+```
+
+This machine uses `linux/arm64`; production must target its node architecture.
+The helper checks that the local nodes share one supported architecture.
+The native commands below reuse an existing tag and only build/push a new one:
+
+```sh
+umask 077
+mkdir -p manual
+TASK_DOCKER_CONFIG=$(mktemp -d)
+trap 'rm -rf "$TASK_DOCKER_CONFIG"' EXIT
+aws --endpoint-url "$FLOCI_ENDPOINT" ecr get-login-password \
+  | docker --config "$TASK_DOCKER_CONFIG" login \
+      --username AWS --password-stdin localhost:4566
+if ! jq -e --arg revision "$IMAGE_REVISION" \
+  'any(.imageDetails[]?; (.imageTags // []) | index($revision))' \
+  manual/backend-images.json >/dev/null; then
+  docker build --platform "$IMAGE_PLATFORM" --provenance=false \
+    --label "org.opencontainers.image.revision=$IMAGE_REVISION" \
+    --tag "$IMAGE_TAG" ../apps/backend
+  docker --config "$TASK_DOCKER_CONFIG" push "$IMAGE_TAG"
+fi
+IMAGE_DIGEST=$(aws --endpoint-url "$FLOCI_ENDPOINT" ecr describe-images \
+  --repository-name book-ninja-local-backend --image-ids "imageTag=$IMAGE_REVISION" \
+  --query 'imageDetails[0].imageDigest' --output text)
+IMAGE_REF="$IMAGE_REPOSITORY@$IMAGE_DIGEST"
+docker --config "$TASK_DOCKER_CONFIG" pull --platform "$IMAGE_PLATFORM" "$IMAGE_REF"
+docker image inspect "$IMAGE_REF" | jq -e --arg image "$IMAGE_REF" --arg revision "$IMAGE_REVISION" \
+  '.[0] | (.RepoDigests | index($image)) != null and
+    .Config.Labels["org.opencontainers.image.revision"] == $revision and .Config.User == "appuser"'
+jq -n --arg revision "$IMAGE_REVISION" --arg platform "$IMAGE_PLATFORM" \
+  --arg repository "$IMAGE_REPOSITORY" --arg imageDigest "$IMAGE_DIGEST" --arg image "$IMAGE_REF" \
+  '{revision:$revision,platform:$platform,repository:$repository,imageDigest:$imageDigest,image:$image}' \
+  > manual/backend-image.json
+rm -rf "$TASK_DOCKER_CONFIG"
+trap - EXIT
+```
+
+Docker 29 on this machine uses its containerd image store. The literal
+`localhost:4566/<account>/<region>/<repository>` path works over HTTP and routes
+to the same Floci ECR repository as its advertised subdomain URI. No Docker
+insecure-registry setting is required. This path, HTTP, and the preload below
+are local-only. Real AWS uses the returned HTTPS ECR URI and IAM-authorized node
+pulls. Floci's registry auth and scan settings do not validate production ECR
+authorization or scanning. The temporary Docker config is deleted after use.
+
+### Preload the image into local k3s and verify execution
+
+Docker Desktop and k3s have separate containerd image stores. Inside k3s,
+`localhost:4566` points at the node, not Floci. Preload and register the digest
+reference explicitly rather than changing registry trust or restarting k3s:
+
+```sh
+set -o pipefail
+docker image save "$IMAGE_TAG" \
+  | docker exec -i floci-aws-eks-book-ninja-local ctr -n k8s.io images import -
+docker exec floci-aws-eks-book-ninja-local ctr -n k8s.io images list "name==$IMAGE_TAG" \
+  | awk -v digest="$IMAGE_DIGEST" 'NR>1 && $3==digest {found=1} END {exit !found}'
+docker exec floci-aws-eks-book-ninja-local ctr -n k8s.io images tag --force "$IMAGE_TAG" "$IMAGE_REF"
+trap 'kubectl --kubeconfig local.kubeconfig.json delete pod backend-image-probe -n book-ninja --ignore-not-found' EXIT
+kubectl --kubeconfig local.kubeconfig.json run backend-image-probe -n book-ninja \
+  --image="$IMAGE_REF" --image-pull-policy=Never --restart=Never \
+  --overrides='{"spec":{"automountServiceAccountToken":false,"securityContext":{
+    "runAsNonRoot":true,"runAsUser":1000,"runAsGroup":1000,"seccompProfile":{"type":"RuntimeDefault"}},
+    "containers":[{"name":"backend-image-probe","image":"'"$IMAGE_REF"'","imagePullPolicy":"Never",
+      "command":["python","-B","-c","import os, fastapi, uvicorn; assert os.getuid() == 1000; print(\"image-preflight-ok\")"],
+      "securityContext":{"allowPrivilegeEscalation":false,"readOnlyRootFilesystem":true,"capabilities":{"drop":["ALL"]}},
+      "resources":{"requests":{"cpu":"50m","memory":"64Mi"},"limits":{"cpu":"500m","memory":"256Mi"}}}]}}'
+kubectl --kubeconfig local.kubeconfig.json wait \
+  --for=jsonpath='{.status.phase}'=Succeeded pod/backend-image-probe -n book-ninja --timeout=120s
+kubectl --kubeconfig local.kubeconfig.json logs backend-image-probe -n book-ninja
+kubectl --kubeconfig local.kubeconfig.json delete pod backend-image-probe -n book-ninja
+trap - EXIT
+```
+
+Expected output: `image-preflight-ok`. This confirms image availability and Python
+execution as a non-root user with a read-only root filesystem. It does not start
+the application, provide fake provider credentials, or test MongoDB/providers.
+Repeat preload after node recreation. The helper checks a loopback kubeconfig,
+verifies the ECR/tag/imported-manifest digest, uses a unique probe name, and always
+attempts probe cleanup. This procedure currently targets the single local node.
+
+### Render and validate the prepared chart
+
+The chart defines a Deployment, ClusterIP Service, ServiceAccount, ConfigMap,
+PodDisruptionBudget, and HPA with at least two replicas. Resource limits, UID 1000,
+read-only root filesystem, disabled API token mounting, and lightweight `/livez`
+probes are configured. It references `backend-runtime` through `envFrom`.
+Ingress, network restrictions, namespace quotas, and Argo CD remain future work.
+
+```sh
+FRONTEND_ORIGIN=$(terraform output -raw frontend_url)
+FRONTEND_ORIGIN=${FRONTEND_ORIGIN%/}
+helm lint ../gitops/charts/book-ninja -f ../gitops/environments/local/backend-values.yaml \
+  --set-string "image.repository=$IMAGE_REPOSITORY" --set-string "image.digest=$IMAGE_DIGEST" \
+  --set-string "config.FRONTEND_ORIGINS=$FRONTEND_ORIGIN"
+helm template book-ninja ../gitops/charts/book-ninja -n book-ninja \
+  -f ../gitops/environments/local/backend-values.yaml \
+  --set-string "image.repository=$IMAGE_REPOSITORY" --set-string "image.digest=$IMAGE_DIGEST" \
+  --set-string "config.FRONTEND_ORIGINS=$FRONTEND_ORIGIN" > manual/backend-rendered.yaml
+kubectl --kubeconfig local.kubeconfig.json apply --dry-run=server \
+  -n book-ninja -f manual/backend-rendered.yaml
+```
+
+Helm lint and server-side dry-run passed. The local overlay records the published
+digest; update it after a future promotion so Git matches the desired image.
+The base chart defaults to `APP_ENV=prod`, while this local overlay uses `dev`.
+Process readiness does not prove MongoDB durability: the current application
+can fall back to in-memory checkpointing. Test integrations separately before
+declaring a rollout usable. Image dependencies and base-image digests remain
+unlocked; production release hardening is separate work.
+
+### Future rollout: only after real runtime values are synchronized
+
+The following commands have **not** been executed. First complete section 18,
+wait for ESO, and preload the matching published image. These commands install
+the release only if the required runtime Secret exists and ESO is ready:
+
+```sh
+kubectl --kubeconfig local.kubeconfig.json wait -n book-ninja \
+  --for=condition=Ready externalsecret/backend-runtime --timeout=120s \
+  && kubectl --kubeconfig local.kubeconfig.json get secret backend-runtime -n book-ninja -o name \
+  && helm upgrade --install book-ninja ../gitops/charts/book-ninja \
+    --kubeconfig local.kubeconfig.json -n book-ninja \
+    -f ../gitops/environments/local/backend-values.yaml \
+    --set-string "image.repository=$IMAGE_REPOSITORY" --set-string "image.digest=$IMAGE_DIGEST" \
+    --set-string "config.FRONTEND_ORIGINS=$FRONTEND_ORIGIN" --wait --timeout=10m
+kubectl --kubeconfig local.kubeconfig.json rollout status deployment/book-ninja-backend \
+  -n book-ninja --timeout=120s
+kubectl --kubeconfig local.kubeconfig.json get deploy,pods,svc,hpa,pdb -n book-ninja
+```
+
+After a successful rollout, use `kubectl port-forward` to the internal Service
+for local smoke tests; public API routing is not installed yet. Environment
+variable consumers need `kubectl rollout restart deployment/book-ninja-backend
+-n book-ninja` after secret rotation. Streaming drain, `/health`, authentication,
+and persistence still require verification with real values.
+
+## 21. Automatic local publication after successful CI (2026-11-19)
+
+GitHub-hosted runners cannot reach this Mac's Floci at `localhost:4566`.
+The repository is public, so local publication uses a per-user macOS publisher,
+not a registered self-hosted GitHub Actions runner. GitHub still runs CI; the
+local process polls the Actions API every 60 seconds using the existing `gh`
+login. It only accepts a successful **push** run of `backend.yml` from this
+repository for the current `develop` head. PR/fork, stale, incomplete, and failed
+runs cannot trigger publication. It does not publish `main` to AWS.
+
+The flow is: merge -> hosted CI -> local source rebuild -> Floci ECR -> digest
+verification and k3s image probe -> image-overlay PR to `develop`. The local
+ARM64 image is rebuilt from the tested source, not downloaded from the hosted
+CI runner. No release artifact reuse or production signing/scanning is implied.
+The PR changes only `gitops/environments/local/backend-values.yaml`; it is not
+auto-merged. Argo CD and application deployment remain separate work.
+
+Backend CI now also checks PRs targeting `develop`, runs provisioning helper
+tests and Helm validation, and watches backend/chart/helper changes. Pushes
+that change only the image overlay are deliberately excluded, preventing
+promotion-merge -> rebuild -> promotion loops. Overlay PRs still receive checks.
+
+### Tools and foreground operation
+
+From `infra/`, using the same local credentials and kubeconfig as prior sections:
+
+```sh
+brew install gh actionlint
+gh auth status
+actionlint ../.github/workflows/backend.yml
+python3 scripts/watch_backend_ci.py
+# Explicit one-shot publication after a qualifying CI run:
+python3 scripts/watch_backend_ci.py --publish
+# Or run continuously in the terminal (stop with Ctrl-C):
+python3 scripts/watch_backend_ci.py --watch --publish
+```
+
+The first invocation only inspects CI. `--publish` enables image writes, a
+promotion branch push, and PR creation. Publication uses the generated local
+provisioner identity, never a real AWS key. GitHub reads/writes use the local
+`gh` login; no GitHub token is placed in GitHub Actions secrets, manifests,
+Terraform, or a LaunchAgent plist. The Mac must be awake, Docker/Floci running,
+and its existing GitHub login available. GitHub App/OIDC release automation for
+production is future work.
+
+### Native CLI equivalent of the CI gate and isolated source checkout
+
+The following is the manual equivalent of the publisher's gate. Stop if any
+verification fails. Current `develop` initially has no matching CI run because
+the preceding infrastructure-only merge did not trigger the old path filter.
+Do not substitute an older successful run for the current head.
+
+```sh
+set -euo pipefail
+TASK_REPO=EjazAhmedRak/book-ninja
+TASK_HEAD=$(gh api "repos/$TASK_REPO/git/ref/heads/develop" --jq .object.sha)
+gh api "repos/$TASK_REPO/actions/workflows/backend.yml/runs?branch=develop&event=push&head_sha=$TASK_HEAD&per_page=1" \
+  > manual/local-publisher-ci.json
+jq -e --arg sha "$TASK_HEAD" --arg repo "$TASK_REPO" '
+  .workflow_runs[0] | .head_sha==$sha and .head_branch=="develop" and
+  .event=="push" and .status=="completed" and .conclusion=="success" and
+  .head_repository.full_name==$repo and .path==".github/workflows/backend.yml"' \
+  manual/local-publisher-ci.json >/dev/null
+git fetch origin develop
+test "$(git rev-parse origin/develop)" = "$TASK_HEAD"
+TASK_CHECKOUT_PARENT=$(mktemp -d)
+TASK_SOURCE_ROOT="$TASK_CHECKOUT_PARENT/source"
+git worktree add --detach "$TASK_SOURCE_ROOT" "$TASK_HEAD"
+trap 'git worktree remove --force "$TASK_SOURCE_ROOT"; rm -rf "$TASK_CHECKOUT_PARENT"' EXIT
+```
+
+Run the native ECR login/build/push/pull/import/probe commands from section 20
+in this same `infra/` control directory, with `IMAGE_REVISION=$TASK_HEAD`. Change
+the build command's context to the isolated tested source as follows; keep the
+same immutable-tag reuse check, platform, temporary Docker config, and digest
+verification from that section. Do not copy credentials into the source checkout:
+
+```sh
+docker build --platform "$IMAGE_PLATFORM" --provenance=false \
+  --label "org.opencontainers.image.revision=$TASK_HEAD" \
+  --tag "$IMAGE_TAG" "$TASK_SOURCE_ROOT/apps/backend"
+```
+
+For the optional helper equivalent, use
+`python3 scripts/publish_backend.py --source-root "$TASK_SOURCE_ROOT"` followed
+by `python3 scripts/verify_backend_image.py`. Both retain credentials and the
+receipt in the control checkout's ignored files. The source checkout stays clean.
+
+### Native CLI equivalent of proposing the verified digest
+
+Continue only after section 20's digest and k3s probe verification has succeeded.
+These are remote write commands; the installed publisher invokes them only
+after the trusted CI gate above. If the branch/PR already exists, inspect/reuse
+it rather than force-pushing or reopening a rejected promotion.
+
+```sh
+test "$(gh api "repos/$TASK_REPO/git/ref/heads/develop" --jq .object.sha)" = "$TASK_HEAD"
+TASK_PROMOTION_BRANCH="deploy/floci-backend-$(printf '%s' "$TASK_HEAD" | cut -c1-12)"
+gh pr list --repo "$TASK_REPO" --base develop --head "$TASK_PROMOTION_BRANCH" \
+  --state all --json url,state > manual/local-publisher-prs.json
+jq -e 'length==0' manual/local-publisher-prs.json >/dev/null
+TASK_OVERLAY="$TASK_SOURCE_ROOT/gitops/environments/local/backend-values.yaml"
+sed -i '' -e "s@^  repository: .*@  repository: $IMAGE_REPOSITORY@" \
+  -e "s@^  digest: .*@  digest: $IMAGE_DIGEST@" "$TASK_OVERLAY"
+helm lint "$TASK_SOURCE_ROOT/gitops/charts/book-ninja" -f "$TASK_OVERLAY" \
+  --set-string config.FRONTEND_ORIGINS=http://localhost:5173
+git -C "$TASK_SOURCE_ROOT" add -- gitops/environments/local/backend-values.yaml
+git -C "$TASK_SOURCE_ROOT" -c core.hooksPath=/dev/null commit \
+  -m "chore(deploy): promote local backend $(printf '%s' "$TASK_HEAD" | cut -c1-12)"
+git -C "$TASK_SOURCE_ROOT" push origin "HEAD:refs/heads/$TASK_PROMOTION_BRANCH"
+cat > manual/local-publisher-pr.md <<EOF
+Promote the local backend built from $TASK_HEAD after successful Backend CI.
+Verified image: $IMAGE_REF
+ECR/pull/import digests, the local image execution probe, and Helm lint passed.
+Only the local image overlay changes. Application rollout remains separate.
+EOF
+gh pr create --repo "$TASK_REPO" --base develop --head "$TASK_PROMOTION_BRANCH" \
+  --title "chore(deploy): promote local backend $(printf '%s' "$TASK_HEAD" | cut -c1-12)" \
+  --body-file manual/local-publisher-pr.md
+git worktree remove --force "$TASK_SOURCE_ROOT"
+rm -rf "$TASK_CHECKOUT_PARENT"
+trap - EXIT
+```
+
+The script also handles an already-current digest without an empty commit,
+reuses a matching promotion branch after a retry, remembers completed/closed
+PRs in ignored `manual/local-publisher-state.json`, and uses a local lock to
+prevent concurrent publisher instances. It rechecks `develop` before promotion
+and defers if a newer merge appeared during the build. It never force-pushes.
+For a digest already in the overlay, skip the manual commit/push/PR commands.
+
+### Background service and its native equivalent
+
+Install the per-user LaunchAgent using the helper from `infra/`:
+
+```sh
+python3 scripts/watch_backend_ci.py --install
+launchctl print "gui/$(id -u)/io.book-ninja.floci-publisher"
+tail -n 10 "$HOME/.local/share/book-ninja-floci-publisher/infra/manual/local-publisher.stdout.log"
+```
+
+The helper writes an owner-only plist to
+`~/Library/LaunchAgents/io.book-ninja.floci-publisher.plist`. macOS prevented
+launchd from starting in the Desktop checkout, so the service uses a separate
+clone at `~/.local/share/book-ninja-floci-publisher`. It copies only its six
+helper modules and the existing local provisioner credentials/kubeconfig,
+preserving owner-only credential permissions and updating the kubeconfig's
+credential-helper path to this control clone. No state-user, bootstrap, ESO
+reader, or application credentials are copied. Logs/state/receipts live in
+that clone's ignored `infra/manual/`. The user's working branch is untouched.
+The service was observed running and logging the expected wait for qualifying CI.
+
+After changing publisher code, rotating provisioner keys, or recreating the
+cluster, stop the service and reinstall it from the primary checkout to refresh
+its helper snapshot and kubeconfig. A repeated install while loaded is a no-op.
+
+The native service installation equivalent is shown below. Use either the
+helper or this recipe, not both. No AWS/GitHub secrets belong in the plist.
+
+```sh
+TASK_PROJECT_ROOT=$(git rev-parse --show-toplevel)
+TASK_CONTROL_ROOT="$HOME/.local/share/book-ninja-floci-publisher"
+if [ ! -d "$TASK_CONTROL_ROOT/.git" ]; then
+  git clone --branch develop --single-branch https://github.com/EjazAhmedRak/book-ninja.git \
+    "$TASK_CONTROL_ROOT"
+fi
+for TASK_HELPER in watch_backend_ci.py publish_backend.py verify_backend_image.py \
+  bootstrap_external_secrets.py bootstrap_floci.py floci_aws.py; do
+  cp "$TASK_PROJECT_ROOT/infra/scripts/$TASK_HELPER" "$TASK_CONTROL_ROOT/infra/scripts/$TASK_HELPER"
+done
+umask 077
+cp local.provisioner.auto.tfvars.json "$TASK_CONTROL_ROOT/infra/local.provisioner.auto.tfvars.json"
+chmod 600 "$TASK_CONTROL_ROOT/infra/local.provisioner.auto.tfvars.json"
+jq --arg old "$TASK_PROJECT_ROOT" --arg new "$TASK_CONTROL_ROOT" \
+  '(.users[].user.exec.args) |= map(if startswith($old + "/") then $new + ltrimstr($old) else . end)' \
+  local.kubeconfig.json > "$TASK_CONTROL_ROOT/infra/local.kubeconfig.json"
+chmod 600 "$TASK_CONTROL_ROOT/infra/local.kubeconfig.json"
+TASK_PYTHON=$(command -v python3)
+TASK_AGENT="$HOME/Library/LaunchAgents/io.book-ninja.floci-publisher.plist"
+mkdir -p "$HOME/Library/LaunchAgents" "$TASK_CONTROL_ROOT/infra/manual"
+touch "$TASK_CONTROL_ROOT/infra/manual/local-publisher.stdout.log" \
+  "$TASK_CONTROL_ROOT/infra/manual/local-publisher.stderr.log"
+chmod 600 "$TASK_CONTROL_ROOT/infra/manual/local-publisher.stdout.log" \
+  "$TASK_CONTROL_ROOT/infra/manual/local-publisher.stderr.log"
+cat > "$TASK_AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>io.book-ninja.floci-publisher</string>
+  <key>ProgramArguments</key><array><string>$TASK_PYTHON</string>
+    <string>$TASK_CONTROL_ROOT/infra/scripts/watch_backend_ci.py</string>
+    <string>--watch</string><string>--publish</string></array>
+  <key>WorkingDirectory</key><string>$TASK_CONTROL_ROOT</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>$TASK_CONTROL_ROOT/infra/manual/local-publisher.stdout.log</string>
+  <key>StandardErrorPath</key><string>$TASK_CONTROL_ROOT/infra/manual/local-publisher.stderr.log</string>
+</dict></plist>
+EOF
+chmod 600 "$TASK_AGENT"
+plutil -lint "$TASK_AGENT"
+launchctl bootstrap "gui/$(id -u)" "$TASK_AGENT"
+```
+
+Stop/remove the service when required; published images, PRs, and logs remain:
+
+```sh
+python3 scripts/watch_backend_ci.py --uninstall
+# Native equivalent (do not repeat if the helper already removed it):
+launchctl bootout "gui/$(id -u)/io.book-ninja.floci-publisher"
+rm "$HOME/Library/LaunchAgents/io.book-ninja.floci-publisher.plist"
+```
+
+Activation status: the CI changes and publisher must be retained/merged before
+the next qualifying `develop` CI run can exercise the complete remote flow.
+The initial live inspection correctly skipped the current untested head; no
+automatic promotion PR has been created yet. Unit tests cover the CI gate,
+dry-run behavior, closed PR reuse, source/digest integrity, promotion changes,
+and advancement of `develop` during publication.
+
+## 22. Maintenance notes and future provisioning log
 
 Completed and verified on 2026-11-12:
 
@@ -1047,14 +1448,34 @@ Next increment on 2026-11-18:
   its backend read policy after probe cleanup.
 - Actual backend configuration remains empty; its ExternalSecret is intentionally unready.
 
+Added on 2026-11-19:
+
+- Published backend revision `62d4a037c942bf1b479e1c9c7df0b720dd8fc3fc` as `linux/arm64`.
+- ECR, Docker pull, and k3s import matched digest
+  `sha256:f402409d9ca7d4b88c706e6ddd0d4d9e1586f10d5a1c573c0ce0cc3e93bd465e`.
+- Reused the immutable tag on a second publication run without replacement.
+- Ran and removed a non-root, read-only filesystem image probe in k3s.
+- Prepared the Helm workload chart; lint and server dry-run passed, release not installed.
+- Verified the chart rejects mutable image references and missing frontend origins.
+- Six Python guard tests pass, including dirty source, remote-cluster, and image-digest checks.
+
+Next automation increment on 2026-11-19:
+
+- Updated Backend CI for `develop` PRs, helper tests, and workload chart checks.
+- Added CI-gated local image publication and digest-promotion PR automation.
+- Kept GitHub CI hosted; no self-hosted GitHub runner is registered.
+- Installed a running per-user publisher outside Desktop; it correctly waits for qualifying CI.
+- Twelve helper tests, workflow actionlint, Helm lint, and runbook shell checks passed.
+- The automatic remote publication/PR path awaits merging this implementation.
+
 Not provisioned yet; add exact commands and verification here as implemented:
 
 - [ ] Real application values in Secrets Manager (local ESO wiring is provisioned).
-- [ ] Backend image publication and digest verification.
-- [ ] Kubernetes application manifests and rollout smoke tests.
+- [x] Local backend image publication and digest verification (section 20).
+- [ ] Application rollout and smoke tests (core workload chart prepared).
 - [ ] Frontend application build and asset publication (hosting infrastructure exists).
 - [ ] API Gateway, VPC Link, internal ALB, ingress, and SSE verification.
-- [ ] Argo CD/GitOps and CI/CD.
+- [ ] Argo CD/GitOps reconciliation and production CI/CD (local publisher implemented).
 - [ ] Egress restrictions, remaining production controls, and AWS validation.
 
 Future entries must include date, purpose, executing identity, commands in
@@ -1062,4 +1483,6 @@ dependency order, generated/ignored files, verification results, and differences
 between local Floci and AWS. Keep this file aligned with Terraform and scripts.
 
 References: [AWS CLI update-kubeconfig](https://docs.aws.amazon.com/cli/latest/reference/eks/update-kubeconfig.html)
-and [Floci EKS behavior](https://github.com/floci-io/floci/blob/main/docs/services/eks.md).
+and [Floci EKS behavior](https://github.com/floci-io/floci/blob/main/docs/services/eks.md),
+[Floci ECR behavior](https://github.com/floci-io/floci/blob/main/docs/services/ecr.md),
+and [Kubernetes probe behavior](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/).

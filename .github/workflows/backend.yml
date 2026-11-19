@@ -6,11 +6,21 @@ on:
     paths:
       - 'apps/backend/**'
       - '.github/workflows/backend.yml'
+      - 'infra/scripts/**'
+      - 'infra/tests/**'
+      - 'gitops/charts/book-ninja/**'
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - 'apps/backend/**'
       - '.github/workflows/backend.yml'
+      - 'infra/scripts/**'
+      - 'infra/tests/**'
+      - 'gitops/charts/book-ninja/**'
+      - 'gitops/environments/local/backend-values.yaml'
+
+permissions:
+  contents: read
 
 jobs:
   lint-test:
@@ -52,10 +62,23 @@ jobs:
       - name: Build Docker image
         run: docker build -t book-ninja-backend:${{ github.sha }} apps/backend
 
-      # Uncomment and configure when registry is chosen (ECR or Artifact Registry)
-      # - name: Push to registry
-      #   if: github.ref == 'refs/heads/main'
-      #   run: |
-      #     echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-      #     docker tag book-ninja-backend:${{ github.sha }} <registry>/book-ninja-backend:latest
-      #     docker push <registry>/book-ninja-backend:latest
+  deployment-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Provisioning helper tests
+        run: python3 -m unittest discover -s infra/tests -p 'test_*.py' -v
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v4.3.2
+      - name: Validate local workload chart
+        run: |
+          helm lint gitops/charts/book-ninja \
+            -f gitops/environments/local/backend-values.yaml \
+            --set-string config.FRONTEND_ORIGINS=http://localhost:5173
+          helm template book-ninja gitops/charts/book-ninja -n book-ninja \
+            -f gitops/environments/local/backend-values.yaml \
+            --set-string config.FRONTEND_ORIGINS=http://localhost:5173 > /tmp/backend-rendered.yaml

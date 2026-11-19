@@ -142,8 +142,25 @@ existing integration diagnostics.
 
 ## Remaining deployment work
 
-API Gateway integration, runtime secret values, application manifests,
+API Gateway integration, runtime secret values, application rollout,
 frontend publication, and GitOps remain to be implemented.
+The [backend workload chart](../gitops/charts/book-ninja/README.md) is prepared
+and validated. Local ECR publication and k3s image execution are verified using
+`scripts/publish_backend.py` and `scripts/verify_backend_image.py`; the actual
+application release awaits real runtime values. See section 20 of the manual
+runbook for the native CLI equivalents and local registry accommodations.
+
+Local CI-driven publication is implemented by `scripts/watch_backend_ci.py`:
+it watches successful push CI for the current `develop` head, builds that source
+in a separate checkout, verifies its image, and proposes only the digest overlay
+in a PR. It does not deploy or auto-merge. Run it without flags for inspection,
+with `--publish` for one publication attempt, or with `--install` for the macOS
+background service. No self-hosted GitHub runner is registered. Section 21 of the
+manual runbook covers authentication, native CLI equivalents, and service removal.
+The service keeps its control clone and local credentials under
+`~/.local/share/book-ninja-floci-publisher` to avoid Desktop background-access
+restrictions. Stop/reinstall it after helper changes or local credential/cluster
+rotation. It is currently running and waiting for a qualifying merged CI run.
 Backend and frontend
 configuration must be supplied in their ignored `.env` files before application
 deployment. Keep Floci-specific accommodations isolated from AWS environments.
