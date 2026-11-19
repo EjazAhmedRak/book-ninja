@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: book-ninja-local-root
+  namespace: argocd
+spec:
+  project: book-ninja-bootstrap
+  source:
+    repoURL: https://github.com/EjazAhmedRak/book-ninja.git
+    targetRevision: develop
+    path: gitops/argocd/local
+    directory:
+      recurse: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  # Root sync is manual until these manifests are reviewed and merged.
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=false

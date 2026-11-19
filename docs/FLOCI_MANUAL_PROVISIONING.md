@@ -1,5 +1,7 @@
 # Book Ninja: manual Floci provisioning runbook
 
+For everyday inspection and debugging, see [Common commands](COMMON_COMMANDS.md).
+
 Last updated: 2026-11-19.
 
 This is the ongoing record of provisioning performed for Book Ninja. Update it
@@ -1403,14 +1405,192 @@ launchctl bootout "gui/$(id -u)/io.book-ninja.floci-publisher"
 rm "$HOME/Library/LaunchAgents/io.book-ninja.floci-publisher.plist"
 ```
 
-Activation status: the CI changes and publisher must be retained/merged before
-the next qualifying `develop` CI run can exercise the complete remote flow.
-The initial live inspection correctly skipped the current untested head; no
-automatic promotion PR has been created yet. Unit tests cover the CI gate,
+Activation status: PR #11 merged, its push CI passed, and the publisher completed
+the first real publication for `d380d5c37680`, opening promotion PR #12 at
+https://github.com/EjazAhmedRak/book-ninja/pull/12. The initial live inspection
+correctly skipped the then-untested head. Unit tests cover the CI gate,
 dry-run behavior, closed PR reuse, source/digest integrity, promotion changes,
 and advancement of `develop` during publication.
 
-## 22. Maintenance notes and future provisioning log
+## 22. Argo CD platform and manual backend preview (2026-11-19)
+
+Installed pinned Helm chart `argo/argo-cd` **10.18.1**, Argo CD **v3.6.1**, in
+namespace `argocd`. Source: the official Argo Helm repository. No AWS resources
+or IAM permissions were added in this increment; use the existing Kubernetes
+bootstrap/admin access. All commands below run from `infra/`.
+
+The API/UI is a ClusterIP Service with TLS and authentication. Anonymous access
+and exec are disabled. The local install uses one controller/server/repo-server
+and Redis, with no Dex, notifications, or active ApplicationSet controller.
+The node has two CPUs; initial discovery caused probe timeouts, so the overlay
+limits status/operation concurrency and gives components six minutes of startup
+probe tolerance with five-second probe timeouts. It retains liveness checks.
+
+### Native Helm/kubectl installation
+
+The helper path is `bash ../gitops/platform/argocd/install-local.sh`. Its native
+equivalent follows. First verify the kubeconfig targets this local loopback API:
+
+```sh
+kubectl --kubeconfig local.kubeconfig.json config view --minify -o json \
+  | jq -e '.clusters[0].cluster.server | test("^https://(localhost|127\\.0\\.0\\.1|\\[::1\\]):")' >/dev/null
+helm repo add argo https://argoproj.github.io/argo-helm --force-update
+helm template argocd argo/argo-cd --version 10.18.1 -n argocd \
+  -f ../gitops/platform/argocd/local-values.yaml > manual/argocd-rendered.yaml
+helm upgrade --install argocd argo/argo-cd --version 10.18.1 \
+  --namespace argocd --create-namespace --kubeconfig local.kubeconfig.json \
+  -f ../gitops/platform/argocd/local-values.yaml --wait --timeout 8m
+kubectl --kubeconfig local.kubeconfig.json wait --for=condition=Established \
+  crd/applications.argoproj.io crd/appprojects.argoproj.io --timeout=120s
+kubectl --kubeconfig local.kubeconfig.json apply -f ../gitops/argocd/local/projects.yaml
+kubectl --kubeconfig local.kubeconfig.json -n argocd get pods,svc,appprojects
+```
+
+Three AppProjects are configured: `default` denies all sources/destinations;
+`book-ninja-local` permits only the approved Book Ninja GitHub repository,
+in-cluster destination `book-ninja`, and Deployment, Service, ConfigMap,
+ServiceAccount, HPA, and PodDisruptionBudget; `book-ninja-bootstrap` permits only
+Application/AppProject metadata in `argocd` from the same repository. The latter
+is trusted platform configuration. Backend sources cannot grant themselves that
+project through their permitted resource types. No backend Secret, IAM key,
+GitHub token, or repository credential is passed to Argo CD; the repo is public.
+
+Project restrictions govern Argo CD applications. The Helm chart's standard
+controller service-account Kubernetes permissions are broader and have not
+been reduced to namespace-only RBAC. HA, SSO, network controls, and production
+controller permissions remain future work.
+
+### Save the initial login privately and access the UI
+
+The Python bootstrap performs the following without printing the password:
+
+```sh
+umask 077
+mkdir -p manual
+kubectl --kubeconfig local.kubeconfig.json -n argocd get secret argocd-initial-admin-secret \
+  -o 'jsonpath={.data.password}' | base64 --decode > manual/argocd-initial-admin-password
+chmod 600 manual/argocd-initial-admin-password
+kubectl --kubeconfig local.kubeconfig.json -n argocd port-forward \
+  --address 127.0.0.1 svc/argocd-server 8443:443
+```
+
+Keep that terminal open and visit `https://127.0.0.1:8443`. It uses a local
+self-signed certificate. Username is `admin`; use the ignored private password
+file. Rotate the password after login, secure the new value, then delete
+`argocd-initial-admin-secret` and its obsolete local password file. That rotation
+has not been performed automatically. Re-running the bootstrap after rotation
+does not recreate a missing initial password Secret.
+
+### Preview the backend source without starting pods
+
+The current live preview pins commit
+`899a871bdcc83d4348993342aec2ca0ee1a8b7b2`, which is reviewed PR #11's source.
+The Application is manual-sync, has no deletion finalizer, and intentionally
+does not deploy the backend. The canonical Git Application follows `develop`
+once the root configuration below has been reviewed/merged.
+
+The helper is `python3 scripts/bootstrap_argocd.py --preview-revision <full-sha>`.
+The equivalent native commands validate the chart source exists, render a local
+Application with an explicit revision, and register it:
+
+```sh
+ARGO_PREVIEW_REVISION=899a871bdcc83d4348993342aec2ca0ee1a8b7b2
+gh api "repos/EjazAhmedRak/book-ninja/contents/gitops/charts/book-ninja/Chart.yaml?ref=$ARGO_PREVIEW_REVISION" \
+  --jq .sha >/dev/null
+kubectl --kubeconfig local.kubeconfig.json create --dry-run=client \
+  -f ../gitops/argocd/local/backend-application.yaml -o json \
+  | jq --arg revision "$ARGO_PREVIEW_REVISION" '.spec.source.targetRevision=$revision |
+      .metadata.annotations={"book-ninja.io/bootstrap-mode":"manual-preview"}' \
+  > manual/argocd-backend-preview.json
+kubectl --kubeconfig local.kubeconfig.json apply -f manual/argocd-backend-preview.json
+kubectl --kubeconfig local.kubeconfig.json -n argocd get application book-ninja-local-backend
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja get deployment book-ninja-backend --ignore-not-found
+```
+
+Expected: `OutOfSync`/`Missing` with the desired chart rendered, and no backend
+Deployment. The source uses the committed local image overlay and explicit
+public frontend origin parameter. Runtime values are still absent, so do not
+sync this backend yet. The frontend origin in the Application must be updated
+if the local CloudFront distribution changes.
+
+### API authentication and Git-render verification
+
+With the port-forward running, the following checks reveal metadata only.
+The `--insecure` flag below is only for this loopback self-signed Argo CD server:
+
+```sh
+curl --insecure --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
+  https://127.0.0.1:8443/api/v1/applications
+umask 077
+trap 'rm -f manual/argocd-api-token manual/argocd-api-header' EXIT
+jq -n --rawfile password manual/argocd-initial-admin-password \
+  '{username:"admin",password:($password | rtrimstr("\n"))}' \
+  | curl --insecure --silent --show-error --fail-with-body \
+      -H 'Content-Type: application/json' --data-binary @- https://127.0.0.1:8443/api/v1/session \
+  | jq -erj .token > manual/argocd-api-token
+printf 'Authorization: Bearer ' > manual/argocd-api-header
+cat manual/argocd-api-token >> manual/argocd-api-header
+printf '\n' >> manual/argocd-api-header
+curl --insecure --silent --show-error --fail \
+  --header @manual/argocd-api-header \
+  https://127.0.0.1:8443/api/v1/applications/book-ninja-local-backend \
+  | jq '{name:.metadata.name,sync:.status.sync,health:.status.health,conditions:.status.conditions}'
+curl --insecure --silent --show-error --fail --header @manual/argocd-api-header \
+  https://127.0.0.1:8443/api/v1/applications/book-ninja-local-backend/manifests \
+  | jq '{renderedManifestCount:(.manifests | length)}'
+rm -f manual/argocd-api-token manual/argocd-api-header
+trap - EXIT
+```
+
+The unauthenticated request must return 401 or 403; authenticated reads must
+succeed. The backend chart renders six resources. This confirms public Git
+fetch and Helm rendering, not a running application or provider health.
+
+### Verify project destination restrictions
+
+Create a disposable manual-sync Application targeting the forbidden `default`
+namespace, observe `InvalidSpecError`, then delete it. No sync is requested:
+
+```sh
+jq '.metadata.name="book-ninja-project-denial-probe" | del(.metadata.annotations) |
+    .spec.destination.namespace="default"' manual/argocd-backend-preview.json \
+  > manual/argocd-project-denial-probe.json
+trap 'kubectl --kubeconfig local.kubeconfig.json -n argocd delete application book-ninja-project-denial-probe --ignore-not-found' EXIT
+kubectl --kubeconfig local.kubeconfig.json apply -f manual/argocd-project-denial-probe.json
+kubectl --kubeconfig local.kubeconfig.json -n argocd wait \
+  --for=jsonpath='{.status.conditions[0].type}'=InvalidSpecError \
+  application/book-ninja-project-denial-probe --timeout=120s
+kubectl --kubeconfig local.kubeconfig.json -n argocd delete application book-ninja-project-denial-probe
+trap - EXIT
+```
+
+### Root Application adoption after this change merges
+
+The root watches only `gitops/argocd/local` and manages the project definitions
+and backend Application. It does not include its own manifest recursively.
+Its metadata sync is manual, and the child backend also stays manual. These
+commands are **future steps** until this Argo CD configuration exists on
+`develop`; the helper checks availability before registering the root:
+
+```sh
+python3 scripts/bootstrap_argocd.py --activate-root
+# Native equivalent of the guarded registration:
+gh api 'repos/EjazAhmedRak/book-ninja/contents/gitops/argocd/local/projects.yaml?ref=develop' \
+  --jq .sha >/dev/null \
+  && kubectl --kubeconfig local.kubeconfig.json apply -f ../gitops/argocd/root-application.yaml
+kubectl --kubeconfig local.kubeconfig.json -n argocd patch application book-ninja-local-root \
+  --type merge -p '{"operation":{"sync":{"prune":false}}}'
+kubectl --kubeconfig local.kubeconfig.json -n argocd get applications
+```
+
+Root sync changes backend source tracking to `develop`; it does not sync the
+child workload. Before backend sync, supply real runtime values (section 18),
+wait for ESO Ready (section 19), and verify/preload the selected digest (section
+20). Once Argo CD owns the backend, use Argo CD sync rather than installing the
+same workload with Helm CLI. Automatic backend sync, application rollout/SSE/
+persistence validation, and production identity/networking remain future work.
+
+## 23. Maintenance notes and future provisioning log
 
 Completed and verified on 2026-11-12:
 
@@ -1466,7 +1646,18 @@ Next automation increment on 2026-11-19:
 - Kept GitHub CI hosted; no self-hosted GitHub runner is registered.
 - Installed a running per-user publisher outside Desktop; it correctly waits for qualifying CI.
 - Twelve helper tests, workflow actionlint, Helm lint, and runbook shell checks passed.
-- The automatic remote publication/PR path awaits merging this implementation.
+- PR #11 merged and the first real automated publication opened promotion PR #12.
+
+Argo CD increment on 2026-11-19:
+
+- Installed chart 10.18.1 / Argo CD v3.6.1 with private TLS access and anonymous login disabled.
+- Added restricted backend/bootstrap projects and disabled the default project.
+- Registered a manual backend preview and prepared the Git root Application.
+- All four platform pods are Ready with zero restarts after local probe/concurrency tuning.
+- Verified unauthenticated API returns 401, authenticated Git/Helm renders six resources,
+  and the project denies a forbidden destination; removed the denial probe.
+- Fifteen Python tests, workflow validation, chart rendering, and 57 runbook shell blocks pass.
+- The actual backend rollout remains paused for real runtime values; root adoption awaits this change merging.
 
 Not provisioned yet; add exact commands and verification here as implemented:
 
@@ -1475,7 +1666,7 @@ Not provisioned yet; add exact commands and verification here as implemented:
 - [ ] Application rollout and smoke tests (core workload chart prepared).
 - [ ] Frontend application build and asset publication (hosting infrastructure exists).
 - [ ] API Gateway, VPC Link, internal ALB, ingress, and SSE verification.
-- [ ] Argo CD/GitOps reconciliation and production CI/CD (local publisher implemented).
+- [ ] Root adoption, backend GitOps sync, and production CI/CD (local publisher and Argo CD platform installed).
 - [ ] Egress restrictions, remaining production controls, and AWS validation.
 
 Future entries must include date, purpose, executing identity, commands in
