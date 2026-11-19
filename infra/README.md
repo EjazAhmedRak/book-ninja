@@ -142,7 +142,7 @@ existing integration diagnostics.
 
 ## Remaining deployment work
 
-API Gateway integration, runtime secret values/injection, application manifests,
+API Gateway integration, runtime secret values, application manifests,
 frontend publication, and GitOps remain to be implemented.
 Backend and frontend
 configuration must be supplied in their ignored `.env` files before application
@@ -160,8 +160,9 @@ returns the viewer address for the checked-in local port configuration.
 
 `secrets.tf` creates `book-ninja/local/backend` metadata locally (environment
 name varies in AWS). Values must be populated outside Terraform; no application
-credentials are written to Terraform state. Kubernetes secret synchronization
-is still pending.
+credentials are written to Terraform state. Local Kubernetes synchronization is
+configured through [External Secrets Operator](../gitops/platform/external-secrets/README.md).
+The backend ExternalSecret remains unready until real runtime values exist.
 
 Run `python3 scripts/bootstrap_provisioner.py` to refresh the existing IAM
 policy before applying these additions. The script reuses its active key.

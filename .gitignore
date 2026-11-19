@@ -40,3 +40,4 @@ infra/local.auto.tfvars.json
 infra/local.provisioner.auto.tfvars.json
 infra/local.kubeconfig.json
 infra/manual/
+infra/local.external-secrets.credentials.json

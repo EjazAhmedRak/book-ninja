@@ -284,6 +284,11 @@ aws --endpoint-url "$FLOCI_ENDPOINT" iam put-user-policy \
       {"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::book-ninja-local-frontend-*","arn:aws:s3:::book-ninja-local-frontend-*/*"]},
       {"Effect":"Allow","Action":["cloudfront:*"],"Resource":"*"},
       {"Effect":"Allow","Action":["secretsmanager:*"],"Resource":"arn:aws:secretsmanager:us-east-1:000000000000:secret:book-ninja/local/*"},
+      {"Effect":"Allow","Resource":"arn:aws:iam::000000000000:user/book-ninja-local-external-secrets","Action":[
+        "iam:CreateUser","iam:GetUser","iam:DeleteUser","iam:TagUser","iam:UntagUser",
+        "iam:ListUserTags","iam:PutUserPolicy","iam:GetUserPolicy","iam:DeleteUserPolicy",
+        "iam:ListUserPolicies","iam:ListAttachedUserPolicies"
+      ]},
       {"Effect":"Allow","Resource":"arn:aws:iam::000000000000:role/book-ninja-local-*","Action":[
         "iam:CreateRole","iam:GetRole","iam:DeleteRole","iam:TagRole","iam:UntagRole",
         "iam:ListRolePolicies","iam:ListAttachedRolePolicies","iam:ListInstanceProfilesForRole",
@@ -792,10 +797,219 @@ aws --endpoint-url "$FLOCI_ENDPOINT" secretsmanager put-secret-value \
   --secret-id book-ninja/local/backend --secret-string file://manual/backend-runtime.json
 ```
 
-Do not print `get-secret-value` output in shared logs. External Secrets Operator,
-its IAM role, and Kubernetes secret injection are not implemented yet.
+Do not print `get-secret-value` output in shared logs. The local operator and
+secret-injection wiring are described in section 19; real runtime values and
+production AWS workload identity remain pending.
 
-## 19. Maintenance notes and future provisioning log
+## 19. Local External Secrets Operator and secret-injection wiring
+
+This step was provisioned on 2026-11-18. Helm chart version: **2.15.0**.
+The operator watches only `book-ninja` and uses a dedicated local IAM reader.
+The Terraform resources do not create this static-key identity in AWS; real
+AWS IRSA/Pod Identity remains separate work. Helm/kubectl bootstrap these Git
+manifests now; Argo CD has not taken ownership yet.
+
+### Prerequisites and Terraform path
+
+From the repository root:
+
+```sh
+brew install helm
+python3 infra/scripts/bootstrap_provisioner.py
+terraform -chdir=infra plan -var-file=environments/local.tfvars
+terraform -chdir=infra apply -var-file=environments/local.tfvars
+python3 infra/scripts/configure_kubeconfig.py
+bash gitops/platform/external-secrets/install-local.sh
+```
+
+The bootstrap policy update in section 6 grants management of only the reader
+user, not arbitrary users. Terraform adds two local resources: IAM user
+`book-ninja-local-external-secrets` and inline policy `ReadBackendRuntime`.
+It never creates an `aws_iam_access_key` resource or records a reader key in state.
+
+### Manual AWS CLI equivalent of the reader user
+
+Run these only on the alternative fresh manual setup, from `infra/`. On the
+existing Terraform-managed environment, skip creation and use the inspection
+commands. Section 6's provisioning policy must be refreshed by the bootstrap
+administrator before creating the reader user with the provisioning profile.
+
+```sh
+export AWS_PROFILE=book-ninja-floci-provisioner
+BACKEND_SECRET_ARN=$(aws --endpoint-url "$FLOCI_ENDPOINT" secretsmanager describe-secret \
+  --secret-id book-ninja/local/backend --query ARN --output text)
+aws --endpoint-url "$FLOCI_ENDPOINT" iam create-user --user-name book-ninja-local-external-secrets \
+  --tags Key=Project,Value=book-ninja Key=Environment,Value=local Key=ManagedBy,Value=manual-cli
+jq -n --arg arn "$BACKEND_SECRET_ARN" '{Version:"2012-10-17",Statement:[{
+  Effect:"Allow",Action:["secretsmanager:GetSecretValue","secretsmanager:DescribeSecret"],Resource:$arn
+}]}' > manual/eso-reader-policy.json
+aws --endpoint-url "$FLOCI_ENDPOINT" iam put-user-policy \
+  --user-name book-ninja-local-external-secrets --policy-name ReadBackendRuntime \
+  --policy-document file://manual/eso-reader-policy.json
+aws --endpoint-url "$FLOCI_ENDPOINT" iam get-user-policy \
+  --user-name book-ninja-local-external-secrets --policy-name ReadBackendRuntime
+```
+
+Only the exact backend secret ARN is readable. No list-all, write, provisioning,
+or IAM administration permission is attached to this reader. The bootstrap
+administrator is used for key creation; the reader never receives bootstrap keys.
+
+Generate a key only if there is no saved active one. This JSON is ignored by
+Git. The helper reuses an existing saved active key rather than generating a new
+one each time. From `infra/`, the manual equivalent is:
+
+```sh
+umask 077
+touch local.external-secrets.credentials.json
+chmod 600 local.external-secrets.credentials.json
+aws --profile book-ninja-floci-bootstrap --endpoint-url "$FLOCI_ENDPOINT" iam create-access-key \
+  --user-name book-ninja-local-external-secrets \
+  --query 'AccessKey.{AccessKeyId:AccessKeyId,SecretAccessKey:SecretAccessKey}' \
+  --output json > local.external-secrets.credentials.json
+aws --profile book-ninja-floci-bootstrap --endpoint-url "$FLOCI_ENDPOINT" iam list-access-keys \
+  --user-name book-ninja-local-external-secrets
+aws configure set aws_access_key_id "$(jq -r '.AccessKeyId' local.external-secrets.credentials.json)" \
+  --profile book-ninja-floci-reader
+aws configure set aws_secret_access_key "$(jq -r '.SecretAccessKey' local.external-secrets.credentials.json)" \
+  --profile book-ninja-floci-reader
+aws configure set region us-east-1 --profile book-ninja-floci-reader
+aws --profile book-ninja-floci-reader --endpoint-url "$FLOCI_ENDPOINT" secretsmanager describe-secret \
+  --secret-id book-ninja/local/backend --query Name
+aws --profile book-ninja-floci-reader --endpoint-url "$FLOCI_ENDPOINT" iam list-users
+```
+
+The last command must return AccessDenied. Back up a saved key file before an
+intentional replacement; do not truncate the existing file on a routine rerun.
+
+### Kubernetes namespace, reader Secret, and Floci endpoint
+
+The checked-in kubeconfig is generated/ignored; the examples below use the
+normal `local.kubeconfig.json`. Substitute `manual/kubeconfig` if following the
+CLI-only kubeconfig path in section 13.
+
+```sh
+kubectl --kubeconfig local.kubeconfig.json create namespace book-ninja --dry-run=client -o yaml \
+  | kubectl --kubeconfig local.kubeconfig.json apply -f -
+mkdir -p manual
+# -j prevents a trailing newline from becoming part of an AWS key in Kubernetes.
+jq -jr '.AccessKeyId' local.external-secrets.credentials.json > manual/eso-access-key
+jq -jr '.SecretAccessKey' local.external-secrets.credentials.json > manual/eso-secret-key
+chmod 600 manual/eso-access-key manual/eso-secret-key
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja create secret generic floci-secrets-reader \
+  --from-file=access-key-id=manual/eso-access-key --from-file=secret-access-key=manual/eso-secret-key \
+  --dry-run=client -o json | kubectl --kubeconfig local.kubeconfig.json apply -f -
+FLOCI_IP=$(docker inspect infra-floci-1 --format '{{(index .NetworkSettings.Networks "infra_default").IPAddress}}')
+jq -n --arg ip "$FLOCI_IP" '{apiVersion:"v1",kind:"List",items:[
+  {apiVersion:"v1",kind:"Service",metadata:{name:"floci-aws",namespace:"book-ninja"},
+   spec:{ports:[{name:"aws",port:4566,targetPort:4566}]}},
+  {apiVersion:"discovery.k8s.io/v1",kind:"EndpointSlice",
+   metadata:{name:"floci-aws-local",namespace:"book-ninja",labels:{
+     "kubernetes.io/service-name":"floci-aws",
+     "endpointslice.kubernetes.io/managed-by":"book-ninja-local-bootstrap"}},
+   addressType:"IPv4",ports:[{name:"aws",port:4566,protocol:"TCP"}],
+   endpoints:[{addresses:[$ip],conditions:{ready:true}}]}
+]}' > manual/floci-service.json
+kubectl --kubeconfig local.kubeconfig.json apply -f manual/floci-service.json
+```
+
+Check that `FLOCI_IP` is nonempty and IPv4 before applying. The preparation
+helper validates it automatically. The Service has no selector: its EndpointSlice
+is managed explicitly. Rerun endpoint preparation after Floci container
+recreation if its Docker IP changes. Pods use the Kubernetes DNS address
+`floci-aws.book-ninja.svc.cluster.local`, not a Docker Compose hostname.
+Do not log Secret manifests or use shell tracing while handling credentials.
+
+### Install the operator and apply the runtime mapping
+
+From `infra/`:
+
+```sh
+helm repo add external-secrets https://charts.external-secrets.io --force-update
+helm upgrade --install external-secrets external-secrets/external-secrets --version 2.15.0 \
+  --namespace external-secrets --create-namespace --kubeconfig local.kubeconfig.json \
+  --values ../gitops/platform/external-secrets/local-values.yaml --wait --timeout 5m
+kubectl --kubeconfig local.kubeconfig.json wait --for=condition=Established \
+  crd/secretstores.external-secrets.io crd/externalsecrets.external-secrets.io --timeout=120s
+kubectl --kubeconfig local.kubeconfig.json apply \
+  -f ../gitops/environments/local/backend-external-secret.yaml
+kubectl --kubeconfig local.kubeconfig.json -n external-secrets get pods
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja get secretstore,externalsecret
+```
+
+`local-values.yaml` contains only non-secret configuration: local endpoint
+overrides, resource limits, scoped RBAC, and controller class `book-ninja-local`.
+The SecretStore's controller class matches that value. Its credentials come
+from `floci-secrets-reader`. The ExternalSecret maps the six required JSON
+properties to `book-ninja/backend-runtime` and refreshes every minute.
+
+The expected current status is **SecretStore Ready, backend ExternalSecret not
+Ready**, because real application values are absent. The store may advertise
+the AWS provider's generic ReadWrite capability; actual access is constrained
+by the IAM policy. No application Secret should be created with missing fields.
+
+After uploading actual values using section 18, wait for the real mapping:
+
+```sh
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja annotate externalsecret backend-runtime \
+  force-sync="$(date +%s)" --overwrite
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja wait \
+  --for=condition=Ready externalsecret/backend-runtime --timeout=120s
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja get secret backend-runtime
+```
+
+Do not print its data. Later application pods can reference it with `envFrom`;
+environment-variable consumers need a rollout to pick up rotated values.
+
+### Disposable end-to-end verification
+
+The automated verification helper was run successfully:
+
+```sh
+python3 scripts/verify_external_secrets.py
+```
+
+It performs the following native operations without reading/modifying backend
+runtime values. The commands below show its manual equivalent; use unique probe
+names and always execute cleanup, including after a failed wait:
+
+```sh
+PROBE="provisioning-probe-$(date +%s)"
+REMOTE_PROBE="book-ninja/local/$PROBE"
+PROBE_ARN=$(aws --endpoint-url "$FLOCI_ENDPOINT" secretsmanager create-secret \
+  --name "$REMOTE_PROBE" --secret-string '{"marker":"non-secret-eso-probe"}' --query ARN --output text)
+jq -n --arg arn "$PROBE_ARN" '{Version:"2012-10-17",Statement:[{
+  Effect:"Allow",Action:["secretsmanager:GetSecretValue","secretsmanager:DescribeSecret"],Resource:$arn
+}]}' > manual/probe-reader-policy.json
+aws --profile book-ninja-floci-bootstrap --endpoint-url "$FLOCI_ENDPOINT" iam put-user-policy \
+  --user-name book-ninja-local-external-secrets --policy-name "$PROBE" \
+  --policy-document file://manual/probe-reader-policy.json
+jq -n --arg name "$PROBE" --arg remote "$REMOTE_PROBE" '{
+  apiVersion:"external-secrets.io/v1",kind:"ExternalSecret",metadata:{name:$name,namespace:"book-ninja"},
+  spec:{refreshInterval:"10s",secretStoreRef:{name:"backend-runtime",kind:"SecretStore"},
+    target:{name:$name,creationPolicy:"Owner"},
+    data:[{secretKey:"marker",remoteRef:{key:$remote,property:"marker"}}]}
+}' > manual/probe-external-secret.json
+kubectl --kubeconfig local.kubeconfig.json apply -f manual/probe-external-secret.json
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja wait \
+  --for=condition=Ready "externalsecret/$PROBE" --timeout=120s
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja get secret "$PROBE" \
+  -o jsonpath='{.data.marker}' | base64 --decode
+# Only this disposable non-secret marker is printed. Never do this to backend-runtime.
+
+# Cleanup exact probe resources, not the real backend secret or reader policy.
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja delete externalsecret "$PROBE" --ignore-not-found
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja delete secret "$PROBE" --ignore-not-found
+aws --endpoint-url "$FLOCI_ENDPOINT" secretsmanager delete-secret --secret-id "$PROBE_ARN" --force-delete-without-recovery
+aws --profile book-ninja-floci-bootstrap --endpoint-url "$FLOCI_ENDPOINT" iam delete-user-policy \
+  --user-name book-ninja-local-external-secrets --policy-name "$PROBE"
+```
+
+The helper uses finally-based cleanup; the manual sequence relies on you to run
+the cleanup block even if verification fails. Permanent IAM permission remains
+backend-only. AWS workload identity and production installation are not covered
+by this local static-key accommodation.
+
+## 20. Maintenance notes and future provisioning log
 
 Completed and verified on 2026-11-12:
 
@@ -822,9 +1036,20 @@ Added on 2026-11-18:
 - Delivery smoke test returned the fixture through CloudFront and 403 directly
   from unsigned S3. All seven Terraform tests passed and a final plan was empty.
 
+Next increment on 2026-11-18:
+
+- Added a dedicated local runtime-secret reader and generated its key outside state/Git.
+- Installed pinned ESO chart 2.15.0 with scoped RBAC, local endpoints, and resource limits.
+- Added SecretStore and explicit backend ExternalSecret mappings.
+- Verified end-to-end synchronization using a cleaned-up disposable probe.
+- All nine Terraform tests and three bootstrap tests passed; the final plan had no drift.
+- Confirmed the controller cannot list Secrets in `default`; the reader retains only
+  its backend read policy after probe cleanup.
+- Actual backend configuration remains empty; its ExternalSecret is intentionally unready.
+
 Not provisioned yet; add exact commands and verification here as implemented:
 
-- [ ] Application configuration and Secrets Manager/External Secrets.
+- [ ] Real application values in Secrets Manager (local ESO wiring is provisioned).
 - [ ] Backend image publication and digest verification.
 - [ ] Kubernetes application manifests and rollout smoke tests.
 - [ ] Frontend application build and asset publication (hosting infrastructure exists).
