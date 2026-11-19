@@ -1,0 +1,10 @@
+# Local runtime overlay. Update repository/digest from the publication receipt
+# when promoting a new image. Supply FRONTEND_ORIGINS from Terraform.
+# Nodes must have access to this image before rollout (see the runbook).
+image:
+  repository: localhost:4566/000000000000/us-east-1/book-ninja-local-backend
+  digest: sha256:f402409d9ca7d4b88c706e6ddd0d4d9e1586f10d5a1c573c0ce0cc3e93bd465e
+config:
+  APP_ENV: dev
+  LANGCHAIN_PROJECT: book-ninja-local
+  LANGCHAIN_TRACING_V2: "false"

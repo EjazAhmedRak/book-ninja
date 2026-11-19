@@ -1,0 +1,6 @@
+apiVersion: v2
+name: book-ninja
+description: Book Ninja backend workload; platform secrets and ingress are managed separately.
+type: application
+version: 0.1.0
+appVersion: "2.0"
