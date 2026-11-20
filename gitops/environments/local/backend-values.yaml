@@ -3,7 +3,7 @@
 # Nodes must have access to this image before rollout (see the runbook).
 image:
   repository: localhost:4566/000000000000/us-east-1/book-ninja-local-backend
-  digest: sha256:977d3c56916ab2890158425875ecd57ec513248bf4f5739508fcc3635f6a4407
+  digest: sha256:031bb49559f12bb2eccc074d350c95f732ecff655a5fe3338a9fbae04db8dda6
 config:
   APP_ENV: dev
   LANGCHAIN_PROJECT: book-ninja-local
