@@ -143,10 +143,10 @@ existing integration diagnostics.
 ## Remaining deployment work
 
 API Gateway integration, runtime secret values, application rollout,
-frontend publication, and GitOps remain to be implemented.
+frontend publication, and backend GitOps sync remain to be implemented.
 The local [Argo CD platform](../gitops/platform/argocd/README.md) is installed
-with scoped projects and a manual backend preview. Root GitOps adoption awaits
-review/merge of its manifests; backend sync still needs real runtime values.
+with scoped projects. The root is Synced/Healthy after metadata adoption;
+backend sync still needs real runtime values.
 The [backend workload chart](../gitops/charts/book-ninja/README.md) is prepared
 and validated. Local ECR publication and k3s image execution are verified using
 `scripts/publish_backend.py` and `scripts/verify_backend_image.py`; the actual
@@ -189,3 +189,24 @@ policy before applying these additions. The script reuses its active key.
 Manual CLI equivalents and delivery/anonymous-denial checks are documented in
 sections 17-18 of the runbook. The backend/frontend `.env` files are absent in
 this checkout, so an authenticated Book Ninja rollout has not yet been attempted.
+
+## Private API foundation
+
+`api_foundation.tf` provisions an internal ALB/listener, empty IP target group,
+VPC Link V2, and Regional REST API container. `terraform output -json api_foundation`
+returns their identifiers. Both API Gateway service endpoints explicitly point
+to Floci locally. No API routes/stage or Kubernetes target binding exists yet.
+The local ALB fixture verified health checks and path/query/header forwarding;
+`scripts/verify_api_foundation.py` removes its disposable target/container afterward.
+
+The existing provisioner receives an additional attached managed API/ELB policy
+because the prior inline user grant is near IAM's 2 KiB limit. Its key is reused.
+Run `scripts/bootstrap_provisioner.py` before applying; native IAM and resource
+commands are in section 23 of the manual runbook.
+
+The design uses Regional REST rather than HTTP API because chat requires response
+streaming. Floci's documented API execution remains buffered, and its documented
+REST VPC-link support is legacy V1. Streaming integration/provider compatibility,
+workload SG attachment/TargetGroupBinding, and AWS SSE validation are pending.
+Floci's SG/subnet declarations do not enforce private-network isolation. No new
+host listener port is published by this change.

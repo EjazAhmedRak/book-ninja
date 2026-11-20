@@ -264,6 +264,9 @@ it now provisions EKS/ECR as well as networking. The following policy mirrors
 `bootstrap_provisioner.py`; the EKS/ECR grants are broad within the emulator,
 not a hardened production IAM policy.
 
+Additional API/ELB permissions use an attached managed policy (section 23),
+because extending this inline user policy exceeded IAM's 2 KiB limit.
+
 ```sh
 aws --endpoint-url "$FLOCI_ENDPOINT" iam create-user \
   --user-name book-ninja-network-provisioner
@@ -1569,8 +1572,8 @@ trap - EXIT
 The root watches only `gitops/argocd/local` and manages the project definitions
 and backend Application. It does not include its own manifest recursively.
 Its metadata sync is manual, and the child backend also stays manual. These
-commands are **future steps** until this Argo CD configuration exists on
-`develop`; the helper checks availability before registering the root:
+commands were executed after PR #13 merged the configuration into `develop`;
+the helper checks availability before registering the root:
 
 ```sh
 python3 scripts/bootstrap_argocd.py --activate-root
@@ -1590,7 +1593,228 @@ wait for ESO Ready (section 19), and verify/preload the selected digest (section
 same workload with Helm CLI. Automatic backend sync, application rollout/SSE/
 persistence validation, and production identity/networking remain future work.
 
-## 23. Maintenance notes and future provisioning log
+## 23. Private API foundation and root adoption (2026-11-19)
+
+Root metadata adoption completed after PR #13 merged: `book-ninja-local-root`
+is **Synced / Healthy / Succeeded**. The backend follows `develop`, still with
+manual sync and no Deployment. Section 22 records the commands; no backend sync
+was run because real runtime values remain missing.
+
+### Streaming correction and scope
+
+AWS HTTP APIs do not support response streaming. Chat's production design now
+uses a **Regional REST API** with a streaming HTTP proxy integration and **VPC
+Link V2** to an internal ALB. V2 identifies the link generation, not an HTTP API.
+Terraform owns the ALB/listener/IP target group; a future Load Balancer Controller
+TargetGroupBinding will bind the existing group to the Kubernetes Service.
+
+This increment created five resources: Regional REST API container, V2 link,
+internal ALB, port-80 listener, and empty IP target group on port 8000 with
+`/livez` checks. No routes, stage, integration, TargetGroupBinding, or public
+API domain is deployed. An API ID alone is not a working application endpoint.
+ALB idle timeout is 300 seconds; production deletion protection is enabled.
+
+Floci documents `STREAM` metadata but buffers API execution; its documented
+REST VPC-link operations are legacy V1. The current Terraform provider direct
+integration schema lacks newer streaming/integration-target fields. Future
+integration work needs validated provider/OpenAPI support and AWS SSE timing
+tests. Do not substitute an invalid V1-to-ALB integration or claim local SSE
+validation. No streaming API stage was deployed in this increment.
+
+Sources: [AWS streaming](https://docs.aws.amazon.com/apigateway/latest/developerguide/response-transfer-mode.html),
+[REST private integrations](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-private-integration.html),
+[Floci API Gateway](https://github.com/floci-io/floci/blob/main/docs/services/api-gateway.md),
+and [Floci ELB](https://github.com/floci-io/floci/blob/main/docs/services/elb.md).
+
+### Managed IAM grant: bootstrap identity
+
+From `infra/`, the helper `python3 scripts/bootstrap_provisioner.py` retains the
+old inline grant and adds/updates an attached managed policy. It reuses the
+active provisioner key. Native equivalent, using the existing bootstrap profile:
+
+```sh
+export AWS_PROFILE=book-ninja-floci-bootstrap
+export AWS_DEFAULT_REGION=us-east-1 AWS_PAGER=""
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+FLOCI_ENDPOINT=http://localhost:4566
+umask 077
+mkdir -p manual
+cat > manual/api-provisioning-policy.json <<'EOF'
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["elasticloadbalancing:*"],"Resource":"*"},
+  {"Effect":"Allow","Action":["apigateway:GET","apigateway:POST","apigateway:PUT","apigateway:PATCH","apigateway:DELETE"],
+   "Resource":["arn:aws:apigateway:us-east-1::/restapis*","arn:aws:apigateway:us-east-1::/vpclinks*"]}
+]}
+EOF
+API_POLICY_ARN=$(aws --endpoint-url "$FLOCI_ENDPOINT" iam list-policies --scope Local \
+  --query "Policies[?PolicyName=='book-ninja-local-api-provisioning'].Arn | [0]" --output text)
+if [ "$API_POLICY_ARN" = None ] || [ -z "$API_POLICY_ARN" ]; then
+  API_POLICY_ARN=$(aws --endpoint-url "$FLOCI_ENDPOINT" iam create-policy \
+    --policy-name book-ninja-local-api-provisioning \
+    --policy-document file://manual/api-provisioning-policy.json --query Policy.Arn --output text)
+else
+  API_POLICY_VERSION=$(aws --endpoint-url "$FLOCI_ENDPOINT" iam get-policy \
+    --policy-arn "$API_POLICY_ARN" --query Policy.DefaultVersionId --output text)
+  aws --endpoint-url "$FLOCI_ENDPOINT" iam get-policy-version --policy-arn "$API_POLICY_ARN" \
+    --version-id "$API_POLICY_VERSION" --query PolicyVersion.Document --output json > manual/api-current-policy.json
+  if ! diff -q <(jq -S . manual/api-current-policy.json) <(jq -S . manual/api-provisioning-policy.json) >/dev/null; then
+    aws --endpoint-url "$FLOCI_ENDPOINT" iam list-policy-versions --policy-arn "$API_POLICY_ARN" \
+      > manual/api-policy-versions.json
+    if [ "$(jq '.Versions | length' manual/api-policy-versions.json)" -ge 5 ]; then
+      API_OLDEST_VERSION=$(jq -r '[.Versions[] | select(.IsDefaultVersion==false)] |
+        sort_by(.CreateDate) | .[0].VersionId' manual/api-policy-versions.json)
+      aws --endpoint-url "$FLOCI_ENDPOINT" iam delete-policy-version \
+        --policy-arn "$API_POLICY_ARN" --version-id "$API_OLDEST_VERSION"
+    fi
+    aws --endpoint-url "$FLOCI_ENDPOINT" iam create-policy-version --policy-arn "$API_POLICY_ARN" \
+      --policy-document file://manual/api-provisioning-policy.json --set-as-default
+  fi
+fi
+aws --endpoint-url "$FLOCI_ENDPOINT" iam attach-user-policy \
+  --user-name book-ninja-network-provisioner --policy-arn "$API_POLICY_ARN"
+aws --endpoint-url "$FLOCI_ENDPOINT" iam list-attached-user-policies --user-name book-ninja-network-provisioner
+```
+
+Never delete the current default policy version. The helper removes only the
+oldest nondefault version when all five slots are occupied. Local ELB permissions
+are broad service-level access, not production IAM hardening. No state-user or
+ESO-reader grant changed and no access key was created.
+
+### Terraform path and private plan handling
+
+Both `apigateway` and `apigatewayv2` endpoints explicitly target Floci. The
+separate V2 endpoint override is required even though the API is REST.
+
+```sh
+python3 scripts/bootstrap_provisioner.py
+terraform fmt -check -recursive
+terraform validate
+terraform test
+terraform plan -var-file=environments/local.tfvars -out=api-foundation.tfplan
+chmod 600 api-foundation.tfplan
+terraform apply api-foundation.tfplan
+terraform output -json api_foundation > manual/api-foundation.json
+```
+
+The ignored saved plan may contain sensitive Terraform inputs. Eleven tests
+pass, covering private subnets/SGs, IP targets/health, Regional API type, and
+production deletion protection. Plan-phase mock overrides use the installed
+Terraform 1.17.1. Apply created five resources and changed/destroyed none.
+
+### Native resource creation: fresh manual environment only
+
+These commands are the alternative to Terraform, not commands to repeat on the
+existing managed resources. Use the VPC/private subnet/SG IDs from earlier manual
+sections. This example looks up those existing prerequisite IDs through Terraform;
+substitute the captured IDs if using the entirely manual ownership path.
+
+```sh
+export AWS_PROFILE=book-ninja-floci-provisioner
+API_PRIVATE_SUBNET_1=$(terraform output -json private_subnet_ids | jq -r '.[0]')
+API_PRIVATE_SUBNET_2=$(terraform output -json private_subnet_ids | jq -r '.[1]')
+API_VPC_ID=$(terraform output -raw vpc_id)
+API_ALB_SG=$(terraform output -json security_group_ids | jq -r .alb)
+API_LINK_SG=$(terraform output -json security_group_ids | jq -r .vpc_link)
+API_ALB_ARN=$(aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 create-load-balancer \
+  --name book-ninja-local-api --type application --scheme internal \
+  --subnets "$API_PRIVATE_SUBNET_1" "$API_PRIVATE_SUBNET_2" --security-groups "$API_ALB_SG" \
+  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 modify-load-balancer-attributes \
+  --load-balancer-arn "$API_ALB_ARN" \
+  --attributes Key=idle_timeout.timeout_seconds,Value=300 Key=deletion_protection.enabled,Value=false
+API_TARGET_ARN=$(aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 create-target-group \
+  --name book-ninja-local-api --protocol HTTP --port 8000 --target-type ip --vpc-id "$API_VPC_ID" \
+  --health-check-protocol HTTP --health-check-port traffic-port --health-check-path /livez \
+  --health-check-interval-seconds 15 --health-check-timeout-seconds 5 \
+  --healthy-threshold-count 2 --unhealthy-threshold-count 2 --matcher HttpCode=200 \
+  --query 'TargetGroups[0].TargetGroupArn' --output text)
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 modify-target-group-attributes \
+  --target-group-arn "$API_TARGET_ARN" --attributes Key=deregistration_delay.timeout_seconds,Value=60
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 create-listener \
+  --load-balancer-arn "$API_ALB_ARN" --protocol HTTP --port 80 \
+  --default-actions "Type=forward,TargetGroupArn=$API_TARGET_ARN"
+API_LINK_ID=$(aws --endpoint-url "$FLOCI_ENDPOINT" apigatewayv2 create-vpc-link \
+  --name book-ninja-local-api --subnet-ids "$API_PRIVATE_SUBNET_1" "$API_PRIVATE_SUBNET_2" \
+  --security-group-ids "$API_LINK_SG" --query VpcLinkId --output text)
+API_REST_ID=$(aws --endpoint-url "$FLOCI_ENDPOINT" apigateway create-rest-api \
+  --name book-ninja-local-api --endpoint-configuration types=REGIONAL --query id --output text)
+```
+
+Terraform uses unique `bnapi-` names rather than these explicit manual names.
+Set production deletion protection true. Real AWS workload security-group
+attachment and routing must be validated before binding targets; defining a
+reserved backend group does not attach it to EKS pods/nodes.
+
+### Inspect without creating anything
+
+```sh
+export AWS_PROFILE=book-ninja-floci-provisioner
+terraform output -json api_foundation > manual/api-foundation.json
+API_ALB_ARN=$(jq -r .alb_arn manual/api-foundation.json)
+API_TARGET_ARN=$(jq -r .target_group_arn manual/api-foundation.json)
+API_LINK_ID=$(jq -r .vpc_link_id manual/api-foundation.json)
+API_REST_ID=$(jq -r .rest_api_id manual/api-foundation.json)
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 describe-load-balancers --load-balancer-arns "$API_ALB_ARN"
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 describe-listeners --load-balancer-arn "$API_ALB_ARN"
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 describe-target-health --target-group-arn "$API_TARGET_ARN"
+aws --endpoint-url "$FLOCI_ENDPOINT" apigatewayv2 get-vpc-link --vpc-link-id "$API_LINK_ID"
+aws --endpoint-url "$FLOCI_ENDPOINT" apigateway get-rest-api --rest-api-id "$API_REST_ID"
+aws --endpoint-url "$FLOCI_ENDPOINT" apigateway get-deployments --rest-api-id "$API_REST_ID"
+```
+
+Expected: active internal ALB, AVAILABLE link, empty target group, no API
+deployments. Listener port 80 exists inside Floci's container and is not
+published as a new host port. Floci stores SG/subnet declarations but does not
+enforce AWS network isolation; forwarding success is not a security proof.
+
+### Disposable ALB routing verification
+
+The helper `python3 scripts/verify_api_foundation.py` rejects nonlocal Kubernetes
+APIs and in-use target groups. It runs the published local image with an
+overridden standard-library HTTP fixture command, without importing application
+configuration or supplying provider credentials. Native equivalent:
+
+```sh
+test "$(aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 describe-target-health \
+  --target-group-arn "$API_TARGET_ARN" --query 'length(TargetHealthDescriptions)' --output text)" = 0
+API_PROBE_IMAGE=$(jq -r .image manual/backend-image.json)
+API_PROBE_NAME="book-ninja-alb-probe-$(date +%s)"
+API_PROBE_MARKER="non-secret-$API_PROBE_NAME"
+docker run --detach --name "$API_PROBE_NAME" --network infra_default \
+  --read-only --cap-drop=ALL --security-opt no-new-privileges --memory 64m --cpus 0.25 \
+  --env "PROBE_MARKER=$API_PROBE_MARKER" \
+  --mount "type=bind,source=$PWD/tests/fixtures/alb_probe.py,target=/probe.py,readonly" \
+  "$API_PROBE_IMAGE" python -B /probe.py
+API_PROBE_IP=$(docker inspect "$API_PROBE_NAME" --format '{{(index .NetworkSettings.Networks "infra_default").IPAddress}}')
+API_PROBE_TARGET="Id=$API_PROBE_IP,Port=8000,AvailabilityZone=all"
+trap 'aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 deregister-targets --target-group-arn "$API_TARGET_ARN" --targets "$API_PROBE_TARGET"; docker rm --force "$API_PROBE_NAME"' EXIT
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 register-targets \
+  --target-group-arn "$API_TARGET_ARN" --targets "$API_PROBE_TARGET"
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 wait target-in-service \
+  --target-group-arn "$API_TARGET_ARN" --targets "$API_PROBE_TARGET"
+API_ALB_DNS=$(jq -r .alb_dns_name manual/api-foundation.json)
+docker exec "$API_PROBE_NAME" python -B -c '
+import http.client,json,sys
+c=http.client.HTTPConnection("infra-floci-1",80,timeout=15)
+c.request("GET","/routing/check?probe=1",headers={"Host":sys.argv[1],"X-Book-Ninja-Probe":"routing-check"})
+r=c.getresponse()
+assert r.status==200,r.status
+assert json.load(r)=={"marker":sys.argv[2],"path":"/routing/check?probe=1","header":"routing-check"}
+print("ALB routing verified")
+' "$API_ALB_DNS" "$API_PROBE_MARKER"
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 deregister-targets \
+  --target-group-arn "$API_TARGET_ARN" --targets "$API_PROBE_TARGET"
+docker rm --force "$API_PROBE_NAME"
+trap - EXIT
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 describe-target-health --target-group-arn "$API_TARGET_ARN"
+```
+
+The probe became healthy and preserved path, query, and custom header through
+the ALB. Cleanup removed its target/container and left the group empty. This
+does not test Kubernetes registration, API Gateway forwarding, VPC security,
+or SSE. Do not run probes against a group serving real application traffic.
+
+## 24. Maintenance notes and future provisioning log
 
 Completed and verified on 2026-11-12:
 
@@ -1657,7 +1881,22 @@ Argo CD increment on 2026-11-19:
 - Verified unauthenticated API returns 401, authenticated Git/Helm renders six resources,
   and the project denies a forbidden destination; removed the denial probe.
 - Fifteen Python tests, workflow validation, chart rendering, and 57 runbook shell blocks pass.
-- The actual backend rollout remains paused for real runtime values; root adoption awaits this change merging.
+- PR #13 merged and root metadata adoption completed; the root is Synced/Healthy.
+
+Private API increment on 2026-11-19:
+
+- Root GitOps metadata adopted and verified Synced/Healthy after PR #13 merged.
+- Corrected the gateway design to Regional REST for response streaming.
+- Added an attached API/ELB managed IAM grant, reusing the existing access key.
+- Provisioned internal ALB/listener, empty IP target group, V2 link, and REST API metadata.
+- Verified ALB health/routing with a disposable target and cleaned up the probe.
+- Routes/stage, Kubernetes target binding, actual application traffic, and SSE remain pending.
+
+Private API increment on 2026-11-19: five foundation resources were applied;
+eleven Terraform tests and eighteen Python tests passed. The disposable ALB
+probe verified health, path/query/header forwarding, and cleanup. The final
+Terraform plan reported no drift. Root metadata is Synced/Healthy; no backend
+workload, API integration/stage, or SSE deployment is claimed.
 
 Not provisioned yet; add exact commands and verification here as implemented:
 
@@ -1665,8 +1904,10 @@ Not provisioned yet; add exact commands and verification here as implemented:
 - [x] Local backend image publication and digest verification (section 20).
 - [ ] Application rollout and smoke tests (core workload chart prepared).
 - [ ] Frontend application build and asset publication (hosting infrastructure exists).
-- [ ] API Gateway, VPC Link, internal ALB, ingress, and SSE verification.
-- [ ] Root adoption, backend GitOps sync, and production CI/CD (local publisher and Argo CD platform installed).
+- [x] Private ALB, VPC Link V2, and Regional REST API foundation (section 23).
+- [ ] Streaming integration/routes/stage, Kubernetes target binding, and SSE verification.
+- [x] Root GitOps metadata adoption (section 22).
+- [ ] Backend GitOps sync and production CI/CD (local publisher and Argo CD platform installed).
 - [ ] Egress restrictions, remaining production controls, and AWS validation.
 
 Future entries must include date, purpose, executing identity, commands in

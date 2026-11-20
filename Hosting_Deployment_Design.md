@@ -22,10 +22,10 @@ Users                                            | token
   |                                              v
   +--> app.example.com --> CloudFront --> private S3 bucket --> React/Vite assets
   |
-  +--> api.example.com --> API Gateway HTTP API --> VPC Link --> internal ALB
+  +--> api.example.com --> API Gateway Regional REST API --> VPC Link V2 --> internal ALB
                                                                     |
                                                                     v
-                                                        EKS Ingress / Service
+                                                    TargetGroupBinding / Service
                                                                     |
                                                                     v
                                                        FastAPI Book Ninja pods
@@ -42,12 +42,30 @@ Users                                            | token
 
 - The frontend is a static Vite build. It is served from a private S3 bucket through CloudFront; it is not deployed to EKS.
 - The FastAPI backend is a stateless EKS workload. MongoDB stores threads and agent memory.
-- API Gateway HTTP API is the public API entry point. A private VPC Link routes calls to an internal ALB created for the Kubernetes ingress.
+- API Gateway Regional REST API is the public API entry point. Configure `responseTransferMode=STREAM` for chat's HTTP proxy integration; HTTP APIs do not support response streaming.
+- Terraform owns the internal ALB, listener, and IP target group. A VPC Link V2 connects the REST API to the ALB; AWS Load Balancer Controller will reconcile a TargetGroupBinding from the existing target group to the backend Service. Do not have an Ingress create a second ALB for this path.
 - EKS nodes and backend pods are in private subnets. Outbound internet traffic uses a NAT Gateway.
 - The MongoDB provider must allowlist the NAT Gateway Elastic IP. No database is exposed from the cluster.
 - Secrets live in AWS Secrets Manager and are synchronized into Kubernetes at runtime using External Secrets Operator. No live secret is committed to Git, Terraform variables, Docker images, or GitHub Actions logs.
 - Kubernetes NetworkPolicies and an egress proxy or AWS Network Firewall restrict outbound connections. Allow only required providers and observability endpoints.
 - Deploy the backend with at least two replicas, resource requests and limits, readiness/liveness probes, a PodDisruptionBudget, and a HorizontalPodAutoscaler.
+
+### API compatibility correction — 2026-11-19
+
+The original HTTP API choice would buffer chat responses. AWS documents response
+streaming for REST APIs and permits ALB private integrations through VPC Link V2.
+The local foundation therefore provisions a Regional REST API container, V2 link,
+internal ALB/listener, and empty IP target group. Routes, stage deployment, and
+TargetGroupBinding are separate work. The current Terraform AWS provider's direct
+integration schema lacks the newer streaming/integration-target fields; their
+future provisioning must use supported provider fields or validated OpenAPI
+extensions. Floci documents `STREAM` metadata but currently buffers execution,
+and its documented REST VPC links are the legacy V1 interface. Do not substitute
+an invalid AWS V1-to-ALB integration or claim local SSE timing validation.
+
+Sources: [AWS response streaming](https://docs.aws.amazon.com/apigateway/latest/developerguide/response-transfer-mode.html),
+[AWS REST private integrations](https://docs.aws.amazon.com/apigateway/latest/developerguide/set-up-private-integration.html),
+and [Floci API Gateway behavior](https://github.com/floci-io/floci/blob/main/docs/services/api-gateway.md).
 
 ## 3. Environments
 
@@ -137,8 +155,8 @@ Provision the AWS foundation reproducibly, then apply the same resource interfac
    - ACM certificate and Route 53 records for the frontend domain in production.
 
 6. **API (`api_gateway.tf`)**
-   - API Gateway HTTP API with custom domain such as `api.example.com`.
-   - VPC Link private integration to the internal ALB/NLB that fronts the Kubernetes ingress.
+   - API Gateway Regional REST API with custom domain such as `api.example.com` and streaming HTTP proxy integration for `/chat`.
+   - VPC Link V2 private integration to the Terraform-owned internal ALB; TargetGroupBinding connects its IP target group to the Kubernetes Service.
    - Routes for `/chat`, `/latestThreads`, `/threads/{proxy+}`, `/health`, and OPTIONS preflight.
    - Access logs, request metrics, throttling, and WAF association for production.
 
@@ -294,8 +312,8 @@ Deploy a tested, immutable backend image to EKS after a reviewed GitOps change.
 ## Application manifest requirements
 
 - Namespace: `book-ninja`.
-- Deployment, Service, Ingress, HPA, PodDisruptionBudget, ServiceAccount, ExternalSecret, NetworkPolicy, and resource quota/limit range.
-- `ClusterIP` service only; the ingress controller is the sole route into the workload.
+- Deployment, Service, TargetGroupBinding, HPA, PodDisruptionBudget, ServiceAccount, ExternalSecret, NetworkPolicy, and resource quota/limit range.
+- `ClusterIP` service only; the ALB targets pods through the controller-managed TargetGroupBinding. Workload security-group attachment and routing must be validated before enabling traffic.
 - Use separate overlays for `local`, `dev`, and `prod`.
 - Local overlay may use Floci/local registry accommodations but must preserve the production manifest contract.
 
@@ -319,9 +337,9 @@ Expose only the required public endpoints while enabling controlled egress to re
 | --- | --- | --- |
 | CloudFront | Serves frontend over HTTPS | Public: `app.example.com` |
 | S3 | Stores static frontend files | Private; CloudFront Origin Access Control only |
-| API Gateway HTTP API | Public API domain, request controls, routing | Public: `api.example.com` |
-| VPC Link | Private API Gateway-to-load-balancer connection | Private |
-| Internal ALB / Kubernetes Ingress | Routes API paths to Book Ninja service | Private |
+| API Gateway Regional REST API | Public API domain, streaming proxy, request controls | Public: `api.example.com` |
+| VPC Link V2 | Private API Gateway-to-load-balancer connection | Private |
+| Internal ALB / TargetGroupBinding | Routes API paths to Book Ninja pods through the Service binding | Private |
 | Kubernetes Service | Stable in-cluster address for FastAPI pods | ClusterIP only |
 
 Configure the frontend with `VITE_API_BASE_URL=https://api.example.com`. Configure CORS on the API to permit only the exact frontend origins for each environment, required methods, and the `Authorization` header. Never use wildcard origins with authenticated requests.
@@ -333,9 +351,10 @@ Configure the frontend with `VITE_API_BASE_URL=https://api.example.com`. Configu
 | `POST /chat` | SSE/streaming chat agent response | Google ID token |
 | `GET /latestThreads` | Recent user threads | Google ID token |
 | `GET /threads/{thread_id}/messages` | Thread rehydration | Google ID token |
-| `GET /health` | Lightweight service health | Public or restricted, no secret detail |
+| `GET /livez` | Lightweight process health | Public or restricted |
+| `GET /health` | Integration diagnostics | Public or restricted, no secret detail |
 
-Validate SSE behaviour through API Gateway, VPC Link, ALB, ingress, and FastAPI before production launch. Configure timeouts and buffering to preserve streaming semantics.
+Validate SSE behaviour through the streaming REST integration, VPC Link V2, ALB, TargetGroupBinding, and FastAPI before production launch. Configure timeouts and buffering to preserve streaming semantics. Floci's buffered API execution cannot establish production streaming correctness.
 
 ## Outbound traffic and egress controls
 

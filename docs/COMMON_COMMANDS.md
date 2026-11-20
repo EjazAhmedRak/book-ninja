@@ -277,6 +277,33 @@ It may differ from the primary checkout's `infra/manual/backend-image.json`.
 Compare the desired Git overlay, ECR digest, and node cache when debugging
 `ErrImagePull`/`ImagePullBackOff`; do not replace an immutable tag or use `latest`.
 
+## Private API foundation
+
+The Regional REST API container, VPC Link V2, internal ALB, and empty target
+group exist. Routes, stage deployment, and workload binding are pending; an
+empty target group and no API deployments are expected. The ALB listener is
+inside Floci's container, without a new published host port.
+
+```sh
+terraform -chdir=infra output -json api_foundation > infra/manual/api-foundation.json
+python3 infra/scripts/floci_aws.py elbv2 describe-load-balancers \
+  --load-balancer-arns "$(jq -r .alb_arn infra/manual/api-foundation.json)"
+python3 infra/scripts/floci_aws.py elbv2 describe-target-health \
+  --target-group-arn "$(jq -r .target_group_arn infra/manual/api-foundation.json)"
+python3 infra/scripts/floci_aws.py apigatewayv2 get-vpc-link \
+  --vpc-link-id "$(jq -r .vpc_link_id infra/manual/api-foundation.json)"
+python3 infra/scripts/floci_aws.py apigateway get-deployments \
+  --rest-api-id "$(jq -r .rest_api_id infra/manual/api-foundation.json)"
+```
+
+The routing smoke helper creates a disposable Docker target and temporarily
+registers it with the ALB, then removes it. Run only while the target group is
+unused; it is not a read-only inspection or an application/SSE test:
+
+```sh
+python3 infra/scripts/verify_api_foundation.py
+```
+
 ## CI and the background local publisher
 
 ```sh

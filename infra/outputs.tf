@@ -20,6 +20,18 @@ output "backend_secret_arn" {
   value = aws_secretsmanager_secret.backend.arn
 }
 
+output "api_foundation" {
+  description = "Private API foundation only; no deployed API stage or application targets yet."
+  value = {
+    rest_api_id      = aws_api_gateway_rest_api.backend.id
+    vpc_link_id      = aws_apigatewayv2_vpc_link.backend.id
+    alb_arn          = aws_lb.backend.arn
+    alb_dns_name     = aws_lb.backend.dns_name
+    listener_arn     = aws_lb_listener.backend.arn
+    target_group_arn = aws_lb_target_group.backend.arn
+  }
+}
+
 output "cluster_name" {
   value = aws_eks_cluster.main.name
 }
