@@ -15,6 +15,12 @@ def ensure_api_policy(user):
                                      "apigateway:PATCH", "apigateway:DELETE"],
         "Resource": ["arn:aws:apigateway:us-east-1::/restapis*",
                      "arn:aws:apigateway:us-east-1::/vpclinks*"],
+    }, {
+        "Effect": "Allow", "Action": [
+            "iam:CreateUser", "iam:GetUser", "iam:DeleteUser", "iam:TagUser", "iam:UntagUser",
+            "iam:ListUserTags", "iam:PutUserPolicy", "iam:GetUserPolicy", "iam:DeleteUserPolicy",
+            "iam:ListUserPolicies", "iam:ListAttachedUserPolicies",
+        ], "Resource": "arn:aws:iam::000000000000:user/book-ninja-local-load-balancer-controller",
     }]}
     policies = aws("iam", "list-policies", "--scope", "Local")["Policies"]
     existing = next((policy for policy in policies if policy["PolicyName"] == name), None)

@@ -11,6 +11,7 @@ on:
       - 'gitops/charts/book-ninja/**'
       - 'gitops/argocd/**'
       - 'gitops/platform/argocd/**'
+      - 'gitops/platform/load-balancer-controller/**'
   pull_request:
     branches: [main, develop]
     paths:
@@ -21,6 +22,7 @@ on:
       - 'gitops/charts/book-ninja/**'
       - 'gitops/argocd/**'
       - 'gitops/platform/argocd/**'
+      - 'gitops/platform/load-balancer-controller/**'
       - 'gitops/environments/local/backend-values.yaml'
 
 permissions:
@@ -92,3 +94,18 @@ jobs:
           helm repo add argo https://argoproj.github.io/argo-helm
           helm template argocd argo/argo-cd --version 10.18.1 -n argocd \
             -f gitops/platform/argocd/local-values.yaml > /tmp/argocd-rendered.yaml
+      - name: Validate target binding and pinned load balancer controller
+        run: |
+          bash -n gitops/platform/load-balancer-controller/install-local.sh
+          helm repo add eks https://aws.github.io/eks-charts
+          helm template aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --version 3.6.3 -n load-balancer-system \
+            -f gitops/platform/load-balancer-controller/local-values.yaml \
+            --set-string vpcId=vpc-01234567 > /tmp/load-balancer-controller-rendered.yaml
+          helm template book-ninja gitops/charts/book-ninja -n book-ninja \
+            -f gitops/environments/local/backend-values.yaml \
+            --set-string config.FRONTEND_ORIGINS=http://localhost:5173 \
+            --set targetGroupBinding.enabled=true \
+            --set-string targetGroupBinding.vpcID=vpc-01234567 \
+            --set-string targetGroupBinding.targetGroupARN=arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/test/0123456789abcdef \
+            > /tmp/backend-with-target-binding.yaml

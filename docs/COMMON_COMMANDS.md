@@ -304,6 +304,38 @@ unused; it is not a read-only inspection or an application/SSE test:
 python3 infra/scripts/verify_api_foundation.py
 ```
 
+## Load balancer controller and target bindings
+
+```sh
+kubectl -n load-balancer-system get pods,services
+kubectl -n load-balancer-system logs deployment/aws-load-balancer-controller --tail=100
+kubectl -n book-ninja get targetgroupbindings
+kubectl -n book-ninja describe targetgroupbinding book-ninja-backend
+kubectl -n book-ninja get endpointslices -l kubernetes.io/service-name=book-ninja-backend
+docker inspect infra-floci-1 --format '{{json .NetworkSettings.Networks}}' | jq 'keys'
+```
+
+No permanent backend binding exists until its chart flag is enabled. If targets
+register but remain unhealthy, compare target IP/port with the EndpointSlice,
+health path, and network reachability. The local host-network fixture needs
+Floci attached to Docker `bridge`; ordinary overlay-pod routing is a separate
+check. Refresh local credentials/network wiring after container recreation:
+
+```sh
+python3 infra/scripts/bootstrap_load_balancer_controller.py
+```
+
+The following creates and removes a temporary host-network pod, Service, and
+binding in an unused target group; it is not a read-only diagnostic:
+
+```sh
+python3 infra/scripts/verify_target_binding.py
+```
+
+For a stuck binding deletion, inspect controller errors and target registrations
+before changing finalizers. The verification helper reports cleanup failures;
+remove only its named probe resources/target, not unrelated application targets.
+
 ## CI and the background local publisher
 
 ```sh

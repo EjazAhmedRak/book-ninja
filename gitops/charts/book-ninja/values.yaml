@@ -23,3 +23,7 @@ autoscaling:
   targetCPUUtilizationPercentage: 70
 podDisruptionBudget:
   minAvailable: 1
+targetGroupBinding:
+  enabled: false
+  targetGroupARN: ""
+  vpcID: ""

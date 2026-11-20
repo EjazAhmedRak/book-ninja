@@ -1,0 +1,33 @@
+replicaCount: 1
+clusterName: book-ninja-local
+region: us-east-1
+watchNamespace: book-ninja
+createIngressClassResource: false
+ingressClass: book-ninja-unused
+enableServiceMutatorWebhook: false
+enablePodReadinessGateInject: false
+enableBackendSecurityGroup: false
+enableManageBackendSecurityGroupRules: false
+enableShield: false
+enableWaf: false
+enableWafv2: false
+targetgroupbindingMaxConcurrentReconciles: 1
+awsMaxRetries: 2
+awsApiEndpoints: "EC2=http://floci-aws.book-ninja.svc.cluster.local:4566,Elastic Load Balancing v2=http://floci-aws.book-ninja.svc.cluster.local:4566,STS=http://floci-aws.book-ninja.svc.cluster.local:4566"
+env:
+  AWS_EC2_METADATA_DISABLED: "true"
+  AWS_ENDPOINT_URL: http://floci-aws.book-ninja.svc.cluster.local:4566
+envFrom:
+  - secretRef:
+      name: floci-load-balancer-controller
+serviceAccount:
+  name: book-ninja-load-balancer-controller
+controllerConfig:
+  featureGates:
+    EnableServiceController: false
+    NLBGatewayAPI: false
+    ALBGatewayAPI: false
+priorityClassName: ""
+resources:
+  requests: {cpu: 50m, memory: 96Mi}
+  limits: {cpu: 300m, memory: 384Mi}

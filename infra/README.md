@@ -210,3 +210,18 @@ REST VPC-link support is legacy V1. Streaming integration/provider compatibility
 workload SG attachment/TargetGroupBinding, and AWS SSE validation are pending.
 Floci's SG/subnet declarations do not enforce private-network isolation. No new
 host listener port is published by this change.
+
+## Local target registration controller
+
+The [AWS Load Balancer Controller](../gitops/platform/load-balancer-controller/README.md)
+is installed with target-group-scoped IAM writes and local endpoint overrides.
+`load_balancer_controller.tf` creates its local-only IAM user/policy; its access
+key is generated outside Terraform and kept in an ignored owner-only file and a
+namespaced Kubernetes Secret. Production workload identity remains separate.
+
+`scripts/bootstrap_load_balancer_controller.py` also attaches Floci to the node's
+existing Docker bridge for local node-IP reachability. The host-network fixture
+in `scripts/verify_target_binding.py` verified controller registration, ALB health
+and forwarding, and cleanup. Ordinary overlay-pod networking and the actual
+backend remain unvalidated. Binding support is opt-in in the workload chart;
+section 24 of the runbook records native provisioning/debugging commands.

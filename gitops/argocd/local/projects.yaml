@@ -30,6 +30,7 @@ spec:
     - {group: apps, kind: Deployment}
     - {group: autoscaling, kind: HorizontalPodAutoscaler}
     - {group: policy, kind: PodDisruptionBudget}
+    - {group: elbv2.k8s.aws, kind: TargetGroupBinding}
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
