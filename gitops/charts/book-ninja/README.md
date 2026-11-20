@@ -5,6 +5,12 @@ ServiceAccount, ConfigMap, PodDisruptionBudget, and CPU HPA. ESO and its runtime
 Secret are managed separately. No ingress, public API, NetworkPolicy, namespace
 quota, or Argo CD Application is installed here yet.
 
+An optional TargetGroupBinding can connect the Service to the Terraform-owned
+IP target group. It defaults off and requires `targetGroupBinding.targetGroupARN`
+and `targetGroupBinding.vpcID`. Install the
+[target controller](../../platform/load-balancer-controller/README.md), adopt the
+updated AppProject permissions, and verify pod networking before enabling it.
+
 The local overlay pins the image published from revision
 `62d4a037c942bf1b479e1c9c7df0b720dd8fc3fc`. The chart requires an image digest
 and explicit frontend origins. Do not put application secrets in Helm values:

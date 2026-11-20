@@ -25,7 +25,8 @@ initial Kubernetes Secret/local file once the new credential is secured.
 ## GitOps boundaries
 
 - `book-ninja-local` permits only this public repository and the `book-ninja`
-  namespace. It allows the six resource types in the backend chart; it cannot
+  namespace. It allows the six core resource types plus the optional
+  TargetGroupBinding after the updated root metadata is synced; it cannot
   manage Secrets, RBAC resources, namespaces, or other cluster-scoped resources.
 - `default` permits no sources/destinations.
 - `book-ninja-bootstrap` permits only Application/AppProject metadata in `argocd`

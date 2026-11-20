@@ -2,7 +2,7 @@
 
 For everyday inspection and debugging, see [Common commands](COMMON_COMMANDS.md).
 
-Last updated: 2026-11-19.
+Last updated: 2026-11-20.
 
 This is the ongoing record of provisioning performed for Book Ninja. Update it
 whenever provisioning is added or changed, including commands, identity,
@@ -1643,7 +1643,10 @@ cat > manual/api-provisioning-policy.json <<'EOF'
 {"Version":"2012-10-17","Statement":[
   {"Effect":"Allow","Action":["elasticloadbalancing:*"],"Resource":"*"},
   {"Effect":"Allow","Action":["apigateway:GET","apigateway:POST","apigateway:PUT","apigateway:PATCH","apigateway:DELETE"],
-   "Resource":["arn:aws:apigateway:us-east-1::/restapis*","arn:aws:apigateway:us-east-1::/vpclinks*"]}
+   "Resource":["arn:aws:apigateway:us-east-1::/restapis*","arn:aws:apigateway:us-east-1::/vpclinks*"]},
+  {"Effect":"Allow","Action":["iam:CreateUser","iam:GetUser","iam:DeleteUser","iam:TagUser","iam:UntagUser",
+    "iam:ListUserTags","iam:PutUserPolicy","iam:GetUserPolicy","iam:DeleteUserPolicy","iam:ListUserPolicies","iam:ListAttachedUserPolicies"],
+   "Resource":"arn:aws:iam::000000000000:user/book-ninja-local-load-balancer-controller"}
 ]}
 EOF
 API_POLICY_ARN=$(aws --endpoint-url "$FLOCI_ENDPOINT" iam list-policies --scope Local \
@@ -1814,7 +1817,252 @@ the ALB. Cleanup removed its target/container and left the group empty. This
 does not test Kubernetes registration, API Gateway forwarding, VPC security,
 or SSE. Do not run probes against a group serving real application traffic.
 
-## 24. Maintenance notes and future provisioning log
+## 24. Local load balancer controller and opt-in binding (2026-11-20)
+
+Installed AWS Load Balancer Controller chart/image **3.6.3** in
+`load-balancer-system`, watching `book-ninja`. Terraform owns the ALB and target
+group; this controller only registers/deregisters endpoints. The backend chart
+can render a TargetGroupBinding but defaults it **off**. The actual application
+remains undeployed until real runtime values and normal pod networking are ready.
+
+### IAM and Terraform provisioning
+
+The managed provisioner grant in section 23 now includes management of exactly
+`book-ninja-local-load-balancer-controller`; refresh that grant first. This avoids
+expanding the old inline provisioner grant past its 2 KiB cap. The native managed
+policy create/version-update commands remain in section 23.
+
+```sh
+python3 scripts/bootstrap_provisioner.py
+terraform fmt -check -recursive
+terraform validate
+terraform test
+terraform plan -var-file=environments/local.tfvars -out=target-binding.tfplan
+chmod 600 target-binding.tfplan
+terraform apply target-binding.tfplan
+```
+
+Apply created two resources: a local-only IAM user and its inline policy.
+Production creates neither. No access key is generated or stored by Terraform.
+The native alternative in a fresh manual environment, using bootstrap IAM
+administration, is:
+
+```sh
+export AWS_PROFILE=book-ninja-floci-bootstrap
+export AWS_DEFAULT_REGION=us-east-1 AWS_PAGER=""
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+FLOCI_ENDPOINT=http://localhost:4566
+umask 077
+mkdir -p manual
+CONTROLLER_TARGET_ARN=$(terraform output -json api_foundation | jq -r .target_group_arn)
+aws --endpoint-url "$FLOCI_ENDPOINT" iam create-user --user-name book-ninja-local-load-balancer-controller
+jq -n --arg target "$CONTROLLER_TARGET_ARN" '{Version:"2012-10-17",Statement:[
+  {Effect:"Allow",Action:["elasticloadbalancing:DescribeTargetGroups","elasticloadbalancing:DescribeTargetHealth",
+    "elasticloadbalancing:DescribeTargetGroupAttributes","elasticloadbalancing:DescribeLoadBalancers",
+    "elasticloadbalancing:DescribeListeners","elasticloadbalancing:DescribeRules"],Resource:"*"},
+  {Effect:"Allow",Action:["elasticloadbalancing:RegisterTargets","elasticloadbalancing:DeregisterTargets"],Resource:$target},
+  {Effect:"Allow",Action:["ec2:DescribeVpcs","ec2:DescribeSubnets","ec2:DescribeInstances",
+    "ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeTags","sts:GetCallerIdentity"],Resource:"*"}
+]}' > manual/controller-policy.json
+aws --endpoint-url "$FLOCI_ENDPOINT" iam put-user-policy --user-name book-ninja-local-load-balancer-controller \
+  --policy-name ReconcileBackendTargets --policy-document file://manual/controller-policy.json
+```
+
+The controller cannot create load balancers, change SG rules, or administer IAM.
+Its registration writes are restricted to the existing target group. Read-only
+EC2/ELB metadata is broader. AWS production requires a workload identity role
+and production networking permissions; the local values must not be installed there.
+
+### Local keys, bridge attachment, and Helm
+
+The helper path is `bash ../gitops/platform/load-balancer-controller/install-local.sh`.
+It reuses an active saved key, creates the credential Secret, refreshes the
+existing Floci Service/EndpointSlice, and installs the pinned chart. For the
+manual equivalent, generate a key only for a fresh user without a saved active
+key; secret access keys are returned only once. This creation was performed by
+the bootstrap administrator and saved privately:
+
+```sh
+aws --endpoint-url "$FLOCI_ENDPOINT" iam list-access-keys \
+  --user-name book-ninja-local-load-balancer-controller
+# Fresh key only; do not overwrite a valid saved key on reruns.
+aws --endpoint-url "$FLOCI_ENDPOINT" iam create-access-key \
+  --user-name book-ninja-local-load-balancer-controller \
+  --query 'AccessKey.{AccessKeyId:AccessKeyId,SecretAccessKey:SecretAccessKey}' --output json \
+  > local.load-balancer-controller.credentials.json
+chmod 600 local.load-balancer-controller.credentials.json
+kubectl --kubeconfig local.kubeconfig.json create namespace load-balancer-system --dry-run=client -o json \
+  | kubectl --kubeconfig local.kubeconfig.json apply -f -
+jq -n --slurpfile keys local.load-balancer-controller.credentials.json \
+  '{apiVersion:"v1",kind:"Secret",type:"Opaque",metadata:{name:"floci-load-balancer-controller",namespace:"load-balancer-system"},
+    stringData:{AWS_ACCESS_KEY_ID:$keys[0].AccessKeyId,AWS_SECRET_ACCESS_KEY:$keys[0].SecretAccessKey}}' \
+  | kubectl --kubeconfig local.kubeconfig.json apply -f -
+```
+
+No keys are printed or put in Helm values/Git/state. The chart uses `envFrom`
+to load these uppercase AWS environment keys. Its alternative `envSecretName`
+expects `key_id`/`access_key`; mixing the two conventions caused a failed initial
+admission test and has been corrected. Restart the controller after rotating
+the credential Secret because environment variables do not refresh in place.
+
+Floci originally could not reach the node's `172.17` address across Docker's
+separate networks. Attach **Floci only** to the node's existing `bridge` network,
+preserving its Compose/VPC attachments. This publishes no host ports and does
+not change the Mac's routes. Reapply after recreating Floci:
+
+```sh
+docker inspect floci-aws-eks-book-ninja-local --format '{{json .NetworkSettings.Networks}}' \
+  | jq -e 'has("bridge")' >/dev/null
+if ! docker inspect infra-floci-1 --format '{{json .NetworkSettings.Networks}}' \
+  | jq -e 'has("bridge")' >/dev/null; then
+  docker network connect bridge infra-floci-1
+fi
+```
+
+With the existing `floci-aws.book-ninja` Service ready (section 19), install:
+
+```sh
+jq -n --arg vpc "$(terraform output -raw vpc_id)" '{vpcId:$vpc}' \
+  > manual/load-balancer-controller-values.json
+helm repo add eks https://aws.github.io/eks-charts --force-update
+helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  --version 3.6.3 -n load-balancer-system --kubeconfig local.kubeconfig.json \
+  -f ../gitops/platform/load-balancer-controller/local-values.yaml \
+  -f manual/load-balancer-controller-values.json --wait --timeout 8m
+kubectl --kubeconfig local.kubeconfig.json wait --for=condition=Established \
+  crd/targetgroupbindings.elbv2.k8s.aws --timeout=120s
+kubectl --kubeconfig local.kubeconfig.json -n load-balancer-system get pods,services
+kubectl --kubeconfig local.kubeconfig.json -n load-balancer-system logs deployment/aws-load-balancer-controller --tail=50
+```
+
+EC2/ELB/STS endpoint overrides stay inside Floci, IMDS is disabled, and VPC/region
+are explicit. Gateway/Service controllers, Service mutation, pod readiness gate
+injection, SG management, WAF/Shield, and default IngressClass creation are
+disabled. The chart retains Kubernetes RBAC/discovery and an Ingress controller
+for an unused class; namespace watch scope does not reduce all cluster RBAC.
+
+### Opt-in backend rendering: no rollout
+
+The AppProject source now permits TargetGroupBinding in addition to the prior
+six workload kinds. Sync root metadata after these changes merge, before
+requesting an Argo CD backend sync. The permanent binding stays disabled in
+the checked-in overlay while the backend is unconfigured.
+
+```sh
+CONTROLLER_TARGET_ARN=$(terraform output -json api_foundation | jq -r .target_group_arn)
+CONTROLLER_VPC_ID=$(terraform output -raw vpc_id)
+helm template book-ninja ../gitops/charts/book-ninja -n book-ninja \
+  -f ../gitops/environments/local/backend-values.yaml \
+  --set-string config.FRONTEND_ORIGINS=http://localhost:5173 \
+  --set targetGroupBinding.enabled=true \
+  --set-string "targetGroupBinding.targetGroupARN=$CONTROLLER_TARGET_ARN" \
+  --set-string "targetGroupBinding.vpcID=$CONTROLLER_VPC_ID" \
+  > manual/backend-with-target-binding.yaml
+kubectl --kubeconfig local.kubeconfig.json apply --dry-run=server -n book-ninja \
+  -f manual/backend-with-target-binding.yaml
+```
+
+This renders a seventh resource, referencing `book-ninja-backend:8000` with IP
+targets and explicit VPC ID. Missing target ARN/VPC ID or an invalid ARN causes
+Helm to fail. Store intended real binding values in Git only after networking
+and runtime readiness checks. Do not use a new Ingress to recreate this ALB.
+
+### Controller reconciliation and routing probe
+
+`python3 scripts/verify_target_binding.py` ran a disposable **host-network** HTTP
+pod on an available Linux-node port, with a ClusterIP Service and TargetGroupBinding.
+The controller registered its endpoint; the target became healthy, ALB forwarded
+the path/query/header, and deleting the binding triggered deregistration. Cleanup
+removed the Service/pod and left the target group empty. The helper refuses an
+in-use target group, attempts cleanup of every resource, and reports failures.
+An initial timed-out run left a Service/pod; both were removed before the
+successful rerun. No temporary binding, pod, Service, or target remains.
+
+The fixture uses the already published local image and standard-library HTTP
+code, without application credentials. This is a local node-network test, not
+ordinary overlay-pod reachability or proof of AWS SG enforcement. It does not
+deploy Book Ninja or validate API Gateway/SSE. Do not enable `hostNetwork` on
+the actual backend to copy this fixture accommodation.
+
+For native inspection of the reconciliation path:
+
+```sh
+export AWS_PROFILE=book-ninja-floci-provisioner
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja get pods,services,endpointslices,targetgroupbindings
+kubectl --kubeconfig local.kubeconfig.json -n load-balancer-system logs deployment/aws-load-balancer-controller --tail=100
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 describe-target-health --target-group-arn "$CONTROLLER_TARGET_ARN"
+```
+
+Native fixture creation/removal, with Python used only inside the HTTP fixture
+and client containers, follows. Ensure the receipt's image is preloaded in k3s
+(section 20). The permanent workload remains untouched:
+
+```sh
+test "$(aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 describe-target-health \
+  --target-group-arn "$CONTROLLER_TARGET_ARN" --query 'length(TargetHealthDescriptions)' --output text)" = 0
+TGB_PROBE_IMAGE=$(jq -r .image manual/backend-image.json)
+TGB_PROBE_NAME="target-binding-probe-$(date +%s)"
+TGB_PROBE_PORT=$(docker run --rm --network container:floci-aws-eks-book-ninja-local \
+  --read-only --cap-drop=ALL "$TGB_PROBE_IMAGE" python -B -c \
+  'import socket; s=socket.socket(); s.bind(("0.0.0.0",0)); print(s.getsockname()[1])')
+jq -n --arg name "$TGB_PROBE_NAME" --arg image "$TGB_PROBE_IMAGE" --argjson port "$TGB_PROBE_PORT" \
+  --rawfile program tests/fixtures/alb_probe.py '{apiVersion:"v1",kind:"Pod",
+  metadata:{name:$name,namespace:"book-ninja",labels:{"book-ninja.io/probe":$name}},
+  spec:{hostNetwork:true,dnsPolicy:"ClusterFirstWithHostNet",restartPolicy:"Never",terminationGracePeriodSeconds:5,
+    automountServiceAccountToken:false,securityContext:{runAsNonRoot:true,runAsUser:1000,seccompProfile:{type:"RuntimeDefault"}},
+    containers:[{name:"fixture",image:$image,imagePullPolicy:"Never",command:["python","-B","-c",$program],
+      env:[{name:"PROBE_MARKER",value:("non-secret-"+$name)},{name:"PROBE_PORT",value:($port|tostring)}],
+      readinessProbe:{httpGet:{path:"/livez",port:$port},periodSeconds:2},
+      securityContext:{readOnlyRootFilesystem:true,allowPrivilegeEscalation:false,capabilities:{drop:["ALL"]}},
+      resources:{requests:{cpu:"25m",memory:"32Mi"},limits:{cpu:"200m",memory:"128Mi"}}}]}}' \
+  > manual/target-binding-probe-pod.json
+cleanup_binding_probe() {
+  TASK_CLEANUP_RC=0
+  kubectl --kubeconfig local.kubeconfig.json -n book-ninja delete targetgroupbinding "$TGB_PROBE_NAME" \
+    --ignore-not-found --timeout=60s || TASK_CLEANUP_RC=1
+  kubectl --kubeconfig local.kubeconfig.json -n book-ninja delete service "$TGB_PROBE_NAME" \
+    --ignore-not-found || TASK_CLEANUP_RC=1
+  kubectl --kubeconfig local.kubeconfig.json -n book-ninja delete pod "$TGB_PROBE_NAME" \
+    --ignore-not-found --timeout=60s || TASK_CLEANUP_RC=1
+  return "$TASK_CLEANUP_RC"
+}
+trap cleanup_binding_probe EXIT
+kubectl --kubeconfig local.kubeconfig.json apply -f manual/target-binding-probe-pod.json
+kubectl --kubeconfig local.kubeconfig.json -n book-ninja wait --for=condition=Ready \
+  "pod/$TGB_PROBE_NAME" --timeout=120s
+jq -n --arg name "$TGB_PROBE_NAME" --arg target "$CONTROLLER_TARGET_ARN" \
+  --arg vpc "$CONTROLLER_VPC_ID" --argjson port "$TGB_PROBE_PORT" '{apiVersion:"v1",kind:"List",items:[
+    {apiVersion:"v1",kind:"Service",metadata:{name:$name,namespace:"book-ninja"},
+      spec:{selector:{"book-ninja.io/probe":$name},ports:[{port:8000,targetPort:$port}]}},
+    {apiVersion:"elbv2.k8s.aws/v1beta1",kind:"TargetGroupBinding",metadata:{name:$name,namespace:"book-ninja"},
+      spec:{targetGroupARN:$target,targetType:"ip",vpcID:$vpc,serviceRef:{name:$name,port:8000}}}
+  ]}' > manual/target-binding-probe-resources.json
+kubectl --kubeconfig local.kubeconfig.json apply -f manual/target-binding-probe-resources.json
+# The controller performs registration; no manual register-targets call is used.
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 wait target-in-service --target-group-arn "$CONTROLLER_TARGET_ARN"
+TGB_ALB_DNS=$(terraform output -json api_foundation | jq -r .alb_dns_name)
+docker run --rm --network container:infra-floci-1 --read-only --cap-drop=ALL \
+  "$TGB_PROBE_IMAGE" python -B -c '
+import http.client,json,sys
+c=http.client.HTTPConnection("127.0.0.1",80,timeout=15)
+c.request("GET","/binding/check?probe=1",headers={"Host":sys.argv[1],"X-Book-Ninja-Probe":"binding-check"})
+r=c.getresponse()
+assert r.status==200,r.status
+assert json.load(r)=={"marker":"non-secret-"+sys.argv[2],"path":"/binding/check?probe=1","header":"binding-check"}
+print("Controller registration and ALB forwarding verified")
+' "$TGB_ALB_DNS" "$TGB_PROBE_NAME"
+cleanup_binding_probe
+trap - EXIT
+aws --endpoint-url "$FLOCI_ENDPOINT" elbv2 describe-target-health --target-group-arn "$CONTROLLER_TARGET_ARN"
+```
+
+Deleting the binding exercises its controller finalizer and deregistration. If
+the controller cannot clean up, the verification helper attempts deregistration
+of only the known probe target and reports failure rather than claiming success.
+Inspect the named resources and controller logs; do not remove unrelated targets
+or strip application finalizers blindly.
+
+## 25. Maintenance notes and future provisioning log
 
 Completed and verified on 2026-11-12:
 
@@ -1897,6 +2145,17 @@ eleven Terraform tests and eighteen Python tests passed. The disposable ALB
 probe verified health, path/query/header forwarding, and cleanup. The final
 Terraform plan reported no drift. Root metadata is Synced/Healthy; no backend
 workload, API integration/stage, or SSE deployment is claimed.
+
+Target registration increment on 2026-11-20:
+
+- Installed controller chart/image 3.6.3 with scoped local IAM target writes.
+- Created/reused an owner-only local controller key outside Terraform/Git.
+- Attached Floci to the node bridge and corrected chart Secret injection to `envFrom`.
+- Verified controller registration, healthy ALB forwarding, and complete fixture cleanup.
+- Added opt-in backend TargetGroupBinding and future AppProject permission.
+- Thirteen Terraform tests and twenty-one Python tests pass; server-side dry-run accepts all seven workload resources.
+- Verified the controller's IAM identity and denied IAM administration. Terraform's final plan has no drift.
+- Actual backend sync, ordinary overlay-pod reachability, and API/SSE remain pending.
 
 Not provisioned yet; add exact commands and verification here as implemented:
 

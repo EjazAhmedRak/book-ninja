@@ -25,4 +25,4 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+    HTTPServer(("0.0.0.0", int(os.environ.get("PROBE_PORT", "8000"))), Handler).serve_forever()
