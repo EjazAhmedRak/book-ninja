@@ -17,6 +17,7 @@ provider "aws" {
     content {
       acm            = endpoints.value
       apigateway     = endpoints.value
+      apigatewayv2   = endpoints.value
       cloudwatch     = endpoints.value
       cloudfront     = endpoints.value
       dynamodb       = endpoints.value
